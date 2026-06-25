@@ -22,6 +22,8 @@ CONCENTRATION_CSV_PATH = os.path.join('.', 'data', 'Ihuaenyi_concentration_data.
 MODEL_DIR = os.path.join('.', 'models')
 RESULTS_DIR = os.path.join('.', 'results', 'v1')
 
+PRED_COLS = ['c', 'k', 'R']
+
 IN_CH_ONE = 3
 IN_CH_TWO = 1
 OUT_CH_ONE = 2
@@ -261,7 +263,6 @@ def eval_pinn(model, data_loader, criterion):
                 n += 1
         total_loss = total_loss / n
         return total_loss
-        
 
 def save_loss_csv(per_epoch_total, per_epoch_data, per_epoch_phys, results_dir=RESULTS_DIR):
     os.makedirs(results_dir, exist_ok=True)
@@ -296,6 +297,28 @@ def save_pointwise_error(model, num_test_slices=1, data_path=CONCENTRATION_CSV_P
     pd.DataFrame(cols).to_csv(os.path.join(results_dir, 'pointwise_error.csv'), index=False)
 
 
+def save_preds(model, field_idx, data_path=CONCENTRATION_CSV_PATH,
+                         results_dir=RESULTS_DIR):
+    if field_idx not in (0, 1, 2):
+        raise ValueError('Invalid field index')
+    in_data, _, _, _ = extract_data(data_path, num_test_slices=0)
+    x = in_data[:NUM_POS, 0]
+    y = in_data[:NUM_POS, 1]
+    pred_field = PRED_COLS[field_idx]
+
+    model.eval()
+    cols = {'x': x, 'y': y}
+    with torch.no_grad():
+        for i in range(NUM_T_STATES):
+            slice_in = in_data[i * NUM_POS:(i + 1) * NUM_POS]
+            inputs = torch.from_numpy(slice_in).to(device)
+            pred = model(inputs)[:, field_idx].cpu().numpy()
+            t_val = TIME_SLICES[i]
+            cols[f'pred_{pred_field}{t_val}'] = pred
+
+    os.makedirs(results_dir, exist_ok=True)
+    pd.DataFrame(cols).to_csv(os.path.join(results_dir, f'pred_{pred_field}.csv'), index=False)
+
 def main():
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
@@ -322,6 +345,8 @@ def main():
     total_eval_loss = eval_pinn(pinn, test_loader, nn.MSELoss())
 
     save_pointwise_error(pinn)
+    save_preds(pinn, 0)
+    save_preds(pinn, 1)
 
 
 if __name__ == "__main__":
