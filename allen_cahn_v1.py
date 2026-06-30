@@ -5,6 +5,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
+
+import scipy
+from scipy.optimize import minimize
 
 import pandas as pd
 
@@ -31,8 +35,16 @@ OUT_CH_TWO = 1
 WIDTH = 32
 DEPTH=4
 
-EPOCHS = 5000
+NEPOCHS_ADAM = 1000
+NEPOCHS_BFGS = 100
+NEPOCHS = NEPOCHS_ADAM + NEPOCHS_BFGS
 LR=1e-4
+
+METHOD_BFGS = "SSBroyden1"   
+METHOD = "BFGS"   
+NCHANGE = 200
+INITIAL_SCALE = False
+BFGS_BATCH = 15650
 
 # datasets and dataloaders
 
@@ -100,14 +112,14 @@ class ConcentrationData(Dataset):
             raise ValueError("Split must be either 'train' or 'test'")
 
 
-def load_concentration_data(data_path=CONCENTRATION_CSV_PATH, num_test_slices=1):
+def load_concentration_data(data_path=CONCENTRATION_CSV_PATH, num_test_slices=1, batch_size=512):
     # this is currently reading csv twice—fine for now but should be changed later
     pin = device.type == 'cuda'
     train_data = ConcentrationData(data_path, 'train',  num_test_slices)
     test_data = ConcentrationData(data_path, 'test',  num_test_slices)
     train_loader = DataLoader(
         dataset=train_data,
-        batch_size=512, 
+        batch_size=batch_size, 
         shuffle=True,
         num_workers=4,
         pin_memory=pin
@@ -120,6 +132,20 @@ def load_concentration_data(data_path=CONCENTRATION_CSV_PATH, num_test_slices=1)
     )
 
     return train_loader, test_loader
+
+def bfgs_loader(data_path=CONCENTRATION_CSV_PATH, num_test_slices=1, batch_size=BFGS_BATCH):
+    # this is currently reading csv twice—fine for now but should be changed later
+    pin = device.type == 'cuda'
+    train_data = ConcentrationData(data_path, 'train',  num_test_slices)
+    train_loader = DataLoader(
+        dataset=train_data,
+        batch_size=batch_size, 
+        shuffle=True,
+        num_workers=4,
+        pin_memory=pin
+    )
+
+    return train_loader
 
 # Residuals
 
@@ -168,6 +194,37 @@ def pinn_loss(
     return total_loss, data_loss, physics_loss
 
 
+def loss_grad_np(
+        weights,
+        model,
+        in_data,
+        c_true,
+        t_diff,
+        lambda_data,
+        lambda_phys):
+    # for BFGS and other 2nd order optimizers
+    first_param = next(model.parameters())
+    dtype = first_param.dtype
+    w_tensor = torch.as_tensor(weights, dtype=dtype, device=device)
+
+    with torch.no_grad():
+        vector_to_parameters(w_tensor, model.parameters())
+
+    total_loss, data_loss, physics_loss = pinn_loss(model,
+                                                    in_data,
+                                                    c_true,
+                                                    t_diff,
+                                                    lambda_data,
+                                                    lambda_phys)
+    
+    params = list(model.parameters())
+    gradsN = torch.autograd.grad(
+        total_loss, params,
+        create_graph=False, retain_graph=False, allow_unused=False)
+    
+    grads_flat = torch.cat([g.reshape(-1) for g in gradsN])
+    return float(total_loss.detach().cpu().item()), grads_flat.detach().cpu().numpy()
+
 # PINNs
 
 class PINN(nn.Module):
@@ -200,21 +257,45 @@ class AllenCahnPINN(nn.Module):
         out = torch.cat([c_k, R], dim=1)
         return out
 
+ # eval
+
+def eval_pinn(model, data_loader):
+    n = 0
+    model.eval()
+    total_loss = 0.0
+    phys_loss = 0.0
+    data_loss = 0.0
+    for inputs, labels in data_loader:
+        inputs, labels = inputs.to(device), labels.to(device)            
+        iter_total_loss, iter_phys_loss, iter_data_loss = pinn_loss(
+            model, inputs, labels, T_DIFF, 
+            lambda_data=1, lambda_phys=100)
+        total_loss += iter_total_loss
+        phys_loss += iter_phys_loss
+        data_loss += iter_data_loss            
+        n += 1       
+    total_loss /= n
+    phys_loss /= n
+    data_loss /= n
+    return total_loss.item(), phys_loss.item(), data_loss.item()
+
 # Training
 
-def train_pinn(model, data_loader, lam_data, lam_phys, epochs=EPOCHS,
-               lr=LR, model_dir=MODEL_DIR):
-    per_epoch_total = np.zeros(epochs)
-    per_epoch_data = np.zeros(epochs)
-    per_epoch_phys = np.zeros(epochs)
+
+def train_pinn(model, adam_loader, bfgs_loader, lam_data, lam_phys, adam_epochs=NEPOCHS_ADAM,
+               bfgs_epochs=NEPOCHS_BFGS, lr=LR, model_dir=MODEL_DIR):
+    per_epoch_total = np.zeros(adam_epochs + bfgs_epochs)
+    per_epoch_data = np.zeros(adam_epochs + bfgs_epochs)
+    per_epoch_phys = np.zeros(adam_epochs + bfgs_epochs)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     best_loss = float('inf')
-    for epoch in range(epochs):
+    for epoch in range(adam_epochs):
         iter_total_loss = 0.0
         iter_data_loss = 0.0
-        iter_physics_loss = 0.0
+        iter_phys_loss = 0.0
         n = 0
-        for inputs, labels in data_loader:
+        
+        for inputs, labels in adam_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
             loss, data_loss, physics_loss = pinn_loss(
@@ -230,39 +311,63 @@ def train_pinn(model, data_loader, lam_data, lam_phys, epochs=EPOCHS,
             n += 1
             iter_total_loss += loss.item()
             iter_data_loss += data_loss.item()
-            iter_physics_loss += physics_loss.item()
+            iter_phys_loss += physics_loss.item()
 
         iter_total_loss /= n
         iter_data_loss /= n
-        iter_physics_loss /= n
+        iter_phys_loss /= n
 
         per_epoch_total[epoch] = iter_total_loss
         per_epoch_data[epoch] = iter_data_loss
-        per_epoch_phys[epoch] = iter_physics_loss
+        per_epoch_phys[epoch] = iter_phys_loss
 
         if iter_total_loss < best_loss:
             best_loss = iter_total_loss
             torch.save(model.state_dict(), os.path.join(model_dir, 'best_model.pt'))
 
         if epoch % 100 == 0:
-            print(f'EPOCH: {epoch}  | data loss: {iter_data_loss}  | physics loss: {iter_physics_loss}  | total loss: {iter_total_loss}')
+            print(f'EPOCH: {epoch}  | data loss: {iter_data_loss}  | physics loss: {iter_phys_loss}  | total loss: {iter_total_loss}')
+
+    initial_weights = parameters_to_vector(model.parameters()).detach().cpu().numpy()
+    H0 = None
+    for epoch in range(bfgs_epochs):
+        n = 0
+        iter_total_loss = 0.0
+        for inputs, labels in bfgs_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            result = minimize(
+                loss_grad_np, 
+                initial_weights, 
+                args=(model, inputs, labels, T_DIFF, lam_data, lam_phys),
+                method=METHOD,
+                jac=True,                    
+                options={
+                    'maxiter': NCHANGE,
+                    'gtol': 1e-8,
+                    'hess_inv0': H0,          
+                    'method_bfgs': METHOD_BFGS,
+                    'initial_scale': INITIAL_SCALE}) 
+            n += 1
+            iter_total_loss += result.fun
+        iter_total_loss /= n
+        initial_weights = result.x
+        H0 = result.hess_inv
+        H0 = 0.5 * (H0 + H0.T)
+        __, iter_phys_loss, iter_data_loss = eval_pinn(model, bfgs_loader)
+        per_epoch_data[NEPOCHS_ADAM + epoch] = iter_data_loss
+        per_epoch_phys[NEPOCHS_ADAM + epoch] = iter_phys_loss
+        per_epoch_total[NEPOCHS_ADAM + epoch] = iter_total_loss
+
+        if iter_total_loss < best_loss:
+            best_loss = iter_total_loss
+            torch.save(model.state_dict(), os.path.join(model_dir, 'best_model.pt'))
+        if epoch % 10 == 0:
+            print(f'EPOCH: {NEPOCHS_ADAM + epoch}  | data loss: {iter_data_loss}  | physics loss: {iter_phys_loss}  | total loss: {iter_total_loss}')
+
     return best_loss, per_epoch_total, per_epoch_data, per_epoch_phys
 
-# eval + plotting
 
-def eval_pinn(model, data_loader, criterion):
-        n = 0
-        model.eval()
-        total_loss = 0.0
-        with torch.no_grad():
-            for inputs, targets in data_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs[:,0], targets.squeeze(1).float())
-                total_loss += loss
-                n += 1
-        total_loss = total_loss / n
-        return total_loss
+# plotting
 
 def save_loss_csv(per_epoch_total, per_epoch_data, per_epoch_phys, results_dir=RESULTS_DIR):
     os.makedirs(results_dir, exist_ok=True)
@@ -323,7 +428,8 @@ def main():
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
-    train_loader, test_loader = load_concentration_data()
+    adam_train_loader, test_loader = load_concentration_data()
+    bfgs_train_loader = bfgs_loader()
 
     netA = PINN(in_channels=IN_CH_ONE, out_channels=OUT_CH_ONE)
     netB = PINN(in_channels=IN_CH_TWO, out_channels=OUT_CH_TWO)
@@ -334,15 +440,15 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     best_loss, per_epoch_total, per_epoch_data, per_epoch_phys = train_pinn(
-        model=pinn, data_loader=train_loader,
-        lam_data=1, lam_phys=100, epochs=EPOCHS,
+        model=pinn, adam_loader=adam_train_loader, bfgs_loader=bfgs_train_loader,
+        lam_data=1, lam_phys=100, adam_epochs=NEPOCHS_ADAM, bfgs_epochs=NEPOCHS_BFGS,
         lr=LR, model_dir=MODEL_DIR,
     )
 
     save_loss_csv(per_epoch_total, per_epoch_data, per_epoch_phys)
 
     pinn.load_state_dict(torch.load(os.path.join(MODEL_DIR, 'best_model.pt')))
-    total_eval_loss = eval_pinn(pinn, test_loader, nn.MSELoss())
+    total_eval_loss, __, __, = eval_pinn(pinn, test_loader)
 
     save_pointwise_error(pinn)
     save_preds(pinn, 0)

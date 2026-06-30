@@ -55,7 +55,7 @@ def plot_pointwise_error(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
     plt.close(fig)
 
 def plot_pred(field, results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
-    if field not in ('c', 'k', 'r'):
+    if field not in ('c', 'k', 'R'):
         raise ValueError('Invalid field requested')
     df = pd.read_csv(os.path.join(results_dir, f'pred_{field}.csv'))
     field_cols = [c for c in df.columns if c.startswith('pred_')]
