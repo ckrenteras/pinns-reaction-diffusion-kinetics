@@ -19,14 +19,14 @@ print(f"Using device: {device}")
 
 NUM_POS = 3130
 NUM_T_STATES = 6
-TIME_SLICES = [0, 16, 32, 43, 63, 71]
+TIME_SLICES = [0, 16, 30, 43, 63, 71]
 T_DIFF = 71
 TAU_SLICES = np.array(TIME_SLICES) / T_DIFF
 CONCENTRATION_CSV_PATH = os.path.join('.', 'data', 'Ihuaenyi_concentration_data.csv')
 MODEL_DIR = os.path.join('.', 'models')
 RESULTS_DIR = os.path.join('.', 'results', 'v1')
 
-PRED_COLS = ['c', 'k', 'R']
+PRED_COLS = ['c', 'k', 'j_0']
 
 IN_CH_ONE = 3
 IN_CH_TWO = 1
@@ -35,8 +35,8 @@ OUT_CH_TWO = 1
 WIDTH = 32
 DEPTH=4
 
-NEPOCHS_ADAM = 1000
-NEPOCHS_BFGS = 100
+NEPOCHS_ADAM = 5000
+NEPOCHS_BFGS = 0
 NEPOCHS = NEPOCHS_ADAM + NEPOCHS_BFGS
 LR=1e-4
 
@@ -45,6 +45,10 @@ METHOD = "BFGS"
 NCHANGE = 200
 INITIAL_SCALE = False
 BFGS_BATCH = 15650
+
+
+n = 1 # TO BE CHANGED!!!
+a = 0.5
 
 # datasets and dataloaders
 
@@ -158,13 +162,13 @@ def compute_time_derivs(component, tau):
         retain_graph=True,
     )[0]
 
-def get_residual(c, k, R, tau, t_diff):
+def get_residual(c, k, j_0, tau, t_diff):
     dc_dtau = compute_time_derivs(c, tau)
 
     # have to divide by t1 - t1 by chain rule to recover time derivs
     dc_dt = dc_dtau / t_diff
 
-    rhs = k * R
+    rhs = k * j_0 *(np.exp(-a * n) - np.exp((1-a)*n))
     return dc_dt - rhs
 
 def pinn_loss(
@@ -181,9 +185,9 @@ def pinn_loss(
     z_hat = model(model_input)
     c_pred = z_hat[:, 0:1]
     k_pred = z_hat[:, 1:2]
-    R_pred = z_hat[:, 2:3]
+    j_0_pred = z_hat[:, 2:3]
     data_loss = torch.mean((c_pred - c_true) ** 2)
-    res = get_residual(c_pred, k_pred, R_pred, tau, t_diff)
+    res = get_residual(c_pred, k_pred, j_0_pred, tau, t_diff)
     physics_loss = torch.mean(res ** 2)
 
 
@@ -253,8 +257,8 @@ class AllenCahnPINN(nn.Module):
     def forward(self, data):
         c_k = self.netA(data)
         c = c_k[:, 0:1]
-        R = self.netB(c)
-        out = torch.cat([c_k, R], dim=1)
+        j_0 = self.netB(c)
+        out = torch.cat([c_k, j_0], dim=1)
         return out
 
  # eval
@@ -453,6 +457,7 @@ def main():
     save_pointwise_error(pinn)
     save_preds(pinn, 0)
     save_preds(pinn, 1)
+    save_preds(pinn, 2)
 
 
 if __name__ == "__main__":

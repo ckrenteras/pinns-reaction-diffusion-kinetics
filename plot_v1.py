@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 
 RESULTS_DIR = os.path.join('.', 'results', 'v1')
 PLOTS_DIR = os.path.join(RESULTS_DIR, 'plots')
+DATA_PATH = os.path.join('.', 'data', 'Ihuaenyi_concentration_data.csv')
+
+TIMES = [0, 16,30, 43, 63, 71]
 
 
 def plot_loss_history(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
@@ -55,7 +58,7 @@ def plot_pointwise_error(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
     plt.close(fig)
 
 def plot_pred(field, results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
-    if field not in ('c', 'k', 'R'):
+    if field not in ('c', 'k', 'j_0'):
         raise ValueError('Invalid field requested')
     df = pd.read_csv(os.path.join(results_dir, f'pred_{field}.csv'))
     field_cols = [c for c in df.columns if c.startswith('pred_')]
@@ -68,7 +71,7 @@ def plot_pred(field, results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
     for idx, col in enumerate(field_cols):
         r, c = divmod(idx, ncols)
         ax = axs[r][c]
-        sc = ax.scatter(df['x'], df['y'], c=df[col], cmap='viridis', s=20)
+        sc = ax.scatter(df['x'], df['y'], c=df[col], cmap='bwr', s=20)
         t_label = col.replace(f'pred_{field}', 't = ')
         ax.set_title(f'Predicted {field}(x, y) ({t_label})')
         ax.set_xlabel('X [μm]')
@@ -90,7 +93,7 @@ def plot_pred(field, results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
 def plot_gt_c(plots_dir=PLOTS_DIR):
     data_path = os.path.join('.', 'data', 'Ihuaenyi_concentration_data.csv')
     df = pd.read_csv(data_path)
-    times = [0, 16, 32, 43, 63, 71]
+    times = [0, 16, 30, 43, 63, 71]
     x = df.iloc[:,0]
     y = df.iloc[:,1]
 
@@ -112,6 +115,69 @@ def plot_gt_c(plots_dir=PLOTS_DIR):
     fig.savefig(os.path.join(plots_dir, 'true_c.png'), dpi=150,
                 bbox_inches='tight')
     plt.close(fig)
+
+
+def plot_old_k(field='k', results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
+    if field not in ('c', 'k', 'j_0'):
+        raise ValueError('Invalid field requested')
+    df = pd.read_csv(os.path.join(results_dir, f'pred_{field}_OLD.csv'))
+    field_cols = [c for c in df.columns if c.startswith('pred_')]
+    n = len(field_cols)
+    ncols = min(3, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axs = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows),
+                             squeeze=False)
+    for idx, col in enumerate(field_cols):
+        r, c = divmod(idx, ncols)
+        ax = axs[r][c]
+        sc = ax.scatter(df['x'], df['y'], c=df[col], cmap='bwr', s=20)
+        t_label = col.replace(f'pred_{field}', 't = ')
+        ax.set_title(f'Predicted {field}(x, y) ({t_label})')
+        ax.set_xlabel('X [μm]')
+        ax.set_ylabel('Y [μm]')
+        cbar = fig.colorbar(sc, ax=ax)
+        cbar.set_label(f'{field}(x, y)')
+
+    for idx in range(n, nrows * ncols):
+        r, c = divmod(idx, ncols)
+        axs[r][c].set_visible(False)
+
+    #fig.suptitle(f'Predicted {field}: Allen–Cahn PINN v1', y=1.02)
+    fig.tight_layout()
+    os.makedirs(plots_dir, exist_ok=True)
+    fig.savefig(os.path.join(plots_dir, f'pred_{field}_OLD.png'), dpi=150,
+                bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_over_c(field, results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
+    if field not in ('k', 'j_0'):
+        raise ValueError('Invalid field requested')
+    df_c = pd.read_csv(DATA_PATH)
+    df_field = pd.read_csv(os.path.join(results_dir, f'pred_{field}.csv'))
+    slices = [
+        pd.DataFrame({
+            'concentration': df_c[f'C [t={time}]'],
+            f'{field}(c)': df_field[f'pred_{field}{time}'],
+        })
+        for time in TIMES
+    ]
+    df_over_c = pd.concat(slices, ignore_index=True)
+
+    df_over_c.to_csv(os.path.join(results_dir, f'{field}_over_c.csv'), index=False)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    ax.scatter(df_over_c['concentration'], df_over_c[f'{field}(c)'], s=10, alpha=0.4)
+    ax.set_xlabel('Concentration')
+    ax.set_ylabel(f'{field}(c)')
+    #ax.set_title('Per-Epoch Loss: Allen–Cahn PINN v1')
+    ax.grid(True, which='both', alpha=0.3)
+    fig.tight_layout()
+    os.makedirs(plots_dir, exist_ok=True)
+    fig.savefig(os.path.join(plots_dir, f'{field}_over_c.png'), dpi=150)
+    plt.close(fig)
     
 
 
@@ -121,3 +187,6 @@ if __name__ == '__main__':
     plot_gt_c()
     plot_pred('c')
     plot_pred('k')
+    plot_pred('j_0')
+    plot_over_c('k')
+    plot_over_c('j_0')
