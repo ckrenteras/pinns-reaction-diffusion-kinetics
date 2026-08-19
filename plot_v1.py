@@ -71,7 +71,7 @@ def plot_pred(field, results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
     for idx, col in enumerate(field_cols):
         r, c = divmod(idx, ncols)
         ax = axs[r][c]
-        sc = ax.scatter(df['x'], df['y'], c=df[col], cmap='bwr', s=20)
+        sc = ax.scatter(df['x'], df['y'], c=df[col], cmap='viridis', s=20)
         t_label = col.replace(f'pred_{field}', 't = ')
         ax.set_title(f'Predicted {field}(x, y) ({t_label})')
         ax.set_xlabel('X [μm]')

@@ -35,8 +35,8 @@ OUT_CH_TWO = 1
 WIDTH = 32
 DEPTH=4
 
-NEPOCHS_ADAM = 5000
-NEPOCHS_BFGS = 0
+NEPOCHS_ADAM = 1000
+NEPOCHS_BFGS = 500
 NEPOCHS = NEPOCHS_ADAM + NEPOCHS_BFGS
 LR=1e-4
 
@@ -333,40 +333,60 @@ def train_pinn(model, adam_loader, bfgs_loader, lam_data, lam_phys, adam_epochs=
             print(f'EPOCH: {epoch}  | data loss: {iter_data_loss}  | physics loss: {iter_phys_loss}  | total loss: {iter_total_loss}')
 
     initial_weights = parameters_to_vector(model.parameters()).detach().cpu().numpy()
-    H0 = None
-    for epoch in range(bfgs_epochs):
-        n = 0
-        iter_total_loss = 0.0
-        for inputs, labels in bfgs_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            result = minimize(
-                loss_grad_np, 
-                initial_weights, 
-                args=(model, inputs, labels, T_DIFF, lam_data, lam_phys),
-                method=METHOD,
-                jac=True,                    
-                options={
-                    'maxiter': NCHANGE,
-                    'gtol': 1e-8,
-                    'hess_inv0': H0,          
-                    'method_bfgs': METHOD_BFGS,
-                    'initial_scale': INITIAL_SCALE}) 
-            n += 1
-            iter_total_loss += result.fun
-        iter_total_loss /= n
-        initial_weights = result.x
-        H0 = result.hess_inv
-        H0 = 0.5 * (H0 + H0.T)
+
+    # one continuous minimize() call instead of restarting every NCHANGE iterations
+    # repeated restarts only symmetrized (not positive-definite always(?)) that carried-over inverse Hessian,
+    # setting off  scipy's positive-definite check
+    bfgs_inputs, bfgs_labels = next(iter(bfgs_loader))
+    bfgs_inputs, bfgs_labels = bfgs_inputs.to(device), bfgs_labels.to(device)
+    dtype = next(model.parameters()).dtype
+
+    state = {'best_loss': best_loss, 'iters': 0}
+
+    def callback(intermediate_result):
+        state['iters'] += 1
+        if state['iters'] % NCHANGE != 0:
+            return
+        epoch = state['iters'] // NCHANGE - 1
+
+        with torch.no_grad():
+            vector_to_parameters(
+                torch.as_tensor(intermediate_result.x, dtype=dtype, device=device),
+                model.parameters())
         __, iter_phys_loss, iter_data_loss = eval_pinn(model, bfgs_loader)
+        iter_total_loss = float(intermediate_result.fun)
+
         per_epoch_data[NEPOCHS_ADAM + epoch] = iter_data_loss
         per_epoch_phys[NEPOCHS_ADAM + epoch] = iter_phys_loss
         per_epoch_total[NEPOCHS_ADAM + epoch] = iter_total_loss
 
-        if iter_total_loss < best_loss:
-            best_loss = iter_total_loss
+        if iter_total_loss < state['best_loss']:
+            state['best_loss'] = iter_total_loss
             torch.save(model.state_dict(), os.path.join(model_dir, 'best_model.pt'))
         if epoch % 10 == 0:
             print(f'EPOCH: {NEPOCHS_ADAM + epoch}  | data loss: {iter_data_loss}  | physics loss: {iter_phys_loss}  | total loss: {iter_total_loss}')
+
+    result = minimize(
+        loss_grad_np,
+        initial_weights,
+        args=(model, bfgs_inputs, bfgs_labels, T_DIFF, lam_data, lam_phys),
+        method=METHOD,
+        jac=True,
+        callback=callback,
+        options={
+            'maxiter': bfgs_epochs * NCHANGE,
+            'gtol': 1e-8,
+            'method_bfgs': METHOD_BFGS,
+            'initial_scale': INITIAL_SCALE})
+
+    print(f'BFGS finished: success={result.success}  message={result.message}  '
+          f'iters={result.nit}/{bfgs_epochs * NCHANGE}')
+
+    with torch.no_grad():
+        vector_to_parameters(
+            torch.as_tensor(result.x, dtype=dtype, device=device),
+            model.parameters())
+    best_loss = state['best_loss']
 
     return best_loss, per_epoch_total, per_epoch_data, per_epoch_phys
 

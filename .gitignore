@@ -1,2 +1,6 @@
 data/
 models/
+__pycache__/
+Helmholtz.py
+logs/
+intro.ipynb

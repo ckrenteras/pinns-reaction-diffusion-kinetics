@@ -1,1 +1,0 @@
-# pinns-reaction-diffusion-kinetics
