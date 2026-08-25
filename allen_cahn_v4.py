@@ -1,4 +1,6 @@
 import os
+# must be set before the CUDA context is created for deterministic CuBLAS matmuls
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 import numpy as np
 import torch
 import torch.nn as nn
@@ -40,6 +42,7 @@ EPS_LEARN_SCALE = torch.tensor(
     [EPS_11_LEARN_SCALE, EPS_22_LEARN_SCALE, EPS_12_LEARN_SCALE], dtype=torch.float32).to(device)
 CONCENTRATION_CSV_PATH = os.path.join('.', 'data', 'Ihuaenyi_concentration_data.csv')
 STRAIN_CSV_PATH = os.path.join('.', 'data', 'Ihuaenyi_strain_data.csv')
+GRF_K_CSV_PATH = os.path.join('.', 'data', 'grf_interpolated.csv')
 MODEL_DIR = os.path.join('.', 'models', 'v4')
 RESULTS_DIR = os.path.join('.', 'results', 'v4')
 EPS_IDX = [11, 22, 12]
@@ -55,6 +58,15 @@ OUT_CH_TWO = 1
 OUT_CH_THREE = 1
 WIDTH = 32
 DEPTH = 5
+
+# netC (j_0(c)) deliberately kept much smaller than netA
+# an overparameterized netC can fit an arbitrarily complex j_0(c) 
+# curve that absorbs spatial variation  through c's own spatial dependence
+#causing k collapse to near-flat
+# netC's should fit whatever spatial pattern the residual
+# demands onto k instead
+NETC_WIDTH = 16
+NETC_DEPTH = 3
 
 # ======= training constants ========
 NEPOCHS_ADAM = 1000
@@ -78,10 +90,37 @@ RAD_RESAMPLE_EVERY = 100
 N_INTERP_BETWEEN = 10
 INTERP_BATCH_SIZE = 512
 
+
+LOSS_TERM_NAMES = ['c', 'e11', 'e22', 'e12', 'allen_cahn', 'force_balance', 'k_reg']
+INTERP_TERM_NAMES = ['interp_c', 'interp_e11', 'interp_e22', 'interp_e12']
+
+# k_reg is a weak prior that k is of order 0 so it is not included in lambda rebalancing
+# force_balance was excluded because its raw magnitude/gradient norm was orders of
+# magnitude larger than the data terms under the old, un-non-dimensionalized residual
+REBALANCED_TERM_NAMES = ['c', 'e11', 'e22', 'e12', 'allen_cahn', 'force_balance']
+
+ALL_TERM_NAMES = LOSS_TERM_NAMES + INTERP_TERM_NAMES
+
+# default weights set constant throughout training to compare test losses per epoch for best model selection
+# these make each term roughly the same magnitude
+DEFAULT_LAMBDAS = {
+    'c': 8.9,
+    'e11': 2.1,
+    'e22': 0.48,
+    'e12': 0.076,
+    'allen_cahn': 100.0,
+    'force_balance': 0.01,
+    'k_reg': 1e-3,
+    'interp_c': 0.1,
+    'interp_e11': 0.1,
+    'interp_e22': 0.1,
+    'interp_e12': 0.1,
+}
+
 # ===== Broyden phase =====
 QN_METHOD = 'SSBROYDEN2' 
 QN_CHANGE_EVERY = 200  # how often rebalance lambdas and refresh the RAD collocation pool
-QN_N_CHANGES = 20 
+QN_N_CHANGES = 10
 QN_MAX_ITERS = QN_CHANGE_EVERY * QN_N_CHANGES
 QN_PRINT_EVERY = 50
 QN_LR = 1.0
@@ -96,7 +135,8 @@ BFGS_BATCH = NUM_POS * (NUM_T_STATES - 1)  # full training set in one batch (num
 
 # ====== physical constants ======
 
-MU_RES = 0
+# mu_res (reservoir chemical potential) is now a learnable scalar on AllenCahnPINN
+# rather than a fixed constant here
 a = 0.5
 BETA_a = 2.33e-6
 BETA_b = 1.52e-6
@@ -116,13 +156,20 @@ Q_aa = C_11 - (C_12**2 / C_22)
 Q_ac = C_13 - ((C_12*C_23) / C_22)
 Q_cc = C_33 - (C_23**2 / C_22)
 
+MPA_TO_PA = 1e6  # stiffness constants above are given in MPa
 C_EQV = torch.tensor([[Q_aa, Q_ac, 0],
                  [Q_ac, Q_cc, 0],
-                 [0, 0, C_55]]).to(device)
+                 [0, 0, C_55]]).to(device) * MPA_TO_PA
+
+# characteristic stress for non-dimensionalizing the force-balance residual (see
+# force_balance()); Q_aa is a representative in-plane stiffness for this material
+FORCE_BALANCE_SIGMA_CHAR = Q_aa * MPA_TO_PA
 
 KBT = 4.1143 * 1e-21
 KAPPA = 5.02 * 1e-10
 C_MAX = 2.29 * 1e4
+N_A = 6.02214076e23  # Avogadro's number converts molar (BETA, C_MAX) quantities to per-particle for dimensional consistency
+UM_TO_M = 1e-6  # position data (x, y) is recorded in micrometers but KAPPA is given in J/m
 
 # ==== data extraction + loaders =======
 
@@ -248,6 +295,14 @@ class IhuaenyiData(Dataset):
         else:
             raise ValueError("Split must be either 'train' or 'test'")
 
+DATALOADER_SEED = 0
+
+
+def _loader_generator(seed=DATALOADER_SEED):
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return g
+
 
 def load_data(c_path=CONCENTRATION_CSV_PATH, strain_path=STRAIN_CSV_PATH, num_test_slices=1, batch_size=512):
     pin = device.type == 'cuda'
@@ -259,8 +314,9 @@ def load_data(c_path=CONCENTRATION_CSV_PATH, strain_path=STRAIN_CSV_PATH, num_te
         dataset=train_data,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=pin
+        num_workers=0,
+        pin_memory=pin,
+        generator=_loader_generator(),
     )
 
     test_loader = DataLoader(
@@ -323,7 +379,8 @@ def interp_loader(concentration_path=CONCENTRATION_CSV_PATH, strain_path=STRAIN_
     print(f'Built {len(in_np)} interpolated pseudo-data points '
           f'({n_between} between each of the {NUM_T_STATES - num_test_slices} training time slices)')
     dataset = TensorDataset(torch.from_numpy(in_np), torch.from_numpy(out_np))
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=pin)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=pin,
+                       generator=_loader_generator())
 
 
 def full_batch_loader(c_path=CONCENTRATION_CSV_PATH, strain_path=STRAIN_CSV_PATH,
@@ -333,7 +390,8 @@ def full_batch_loader(c_path=CONCENTRATION_CSV_PATH, strain_path=STRAIN_CSV_PATH
     train_data = IhuaenyiData(concentration_path=c_path, strain_path=strain_path,
                                split='train', num_test_slices=num_test_slices)
     return DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True,
-                       num_workers=4, pin_memory=pin)
+                       num_workers=0, pin_memory=pin,
+                       generator=_loader_generator())
 
 
 # ====== mathematical operations (normalize, time/spatial deriv., etc.) =======
@@ -401,6 +459,14 @@ class AllenCahnPINN(nn.Module):
         self.netA = netA
         self.netB = netB
         self.netC = netC
+        # raw param kept near O(1) for Adam; mu itself is ~KBT scale (~1e-21), so an
+        # unscaled parameter blows up eta = (mu - mu_res)/KBT after a single optimizer
+        # step, since Adam's step size is ~lr regardless of the parameter's natural scale
+        self.mu_res_raw = nn.Parameter(torch.zeros(1))
+
+    @property
+    def mu_res(self):
+        return self.mu_res_raw * KBT
 
     def forward(self, c_eps_data):
         c_eps = self.netA(c_eps_data)
@@ -445,15 +511,17 @@ def stress_strain_eq(c, c_0, epsilon):
     elastic_strain_voigt = epsilon_voigt_vector(elastic_strain)
     return  (C_EQV @ elastic_strain_voigt.T).T
 
-def force_balance(sigma, pos, pos_diff):
-    """epects input sigma in voigt notation"""
-    sigma_11 = sigma[:, 0:1]
-    sigma_22 = sigma[:, 1:2]
-    sigma_12 = sigma[:, 2:3]
+def force_balance(sigma, pos):
+    """expects input sigma in voigt notation. non-dimensionalized by Q_aa so the residual sits
+    at the same O(1) order as the other loss terms """
+    sigma_nd = sigma / FORCE_BALANCE_SIGMA_CHAR
+    sigma_11 = sigma_nd[:, 0:1]
+    sigma_22 = sigma_nd[:, 1:2]
+    sigma_12 = sigma_nd[:, 2:3]
 
-    dsigma_11 = compute_spatial_grad(sigma_11, pos) / pos_diff
-    dsigma_22 = compute_spatial_grad(sigma_22, pos) / pos_diff
-    dsigma_12 = compute_spatial_grad(sigma_12, pos) / pos_diff
+    dsigma_11 = compute_spatial_grad(sigma_11, pos)
+    dsigma_22 = compute_spatial_grad(sigma_22, pos)
+    dsigma_12 = compute_spatial_grad(sigma_12, pos)
 
     div_sigma_x = dsigma_11[:, 0:1] + dsigma_12[:, 1:2]
     div_sigma_y = dsigma_12[:, 0:1] + dsigma_22[:, 1:2]
@@ -462,20 +530,34 @@ def force_balance(sigma, pos, pos_diff):
 
 # ====== allen-cahn eq ========
 def get_mu_h(c):
+    # Approximation given by Royal
+    # Note: checked 2026-08-24 against data/chem.csv over the actual measured 
+    # concentration range (~0.01-0.99) and mean abs gap is ~0.064
+    # about 0.13 near the concentration boundarie
+    # inherent limitation to this approximation, should be addressed
     return torch.log(c / (1 - c)) + 3.311*(1 - 2 *c)
 
 def get_mu(mu_h, c, sigma, pos, pos_diff):
-    """expects sigma as a voigt vector; mu = mu_h(c) - k*laplacian(c) - beta:sigma"""
+    """expects sigma as a voigt vector; mu = mu_h(c) - k*laplacian(c) - beta:sigma,
+    all terms combined on a per-lithium-site (particle) energy basis to match KBT*mu_h"""
     sigma_11 = sigma[:, 0:1]
     sigma_22 = sigma[:, 1:2]
-    stress_term = (BETA_a * sigma_11 + BETA_c * sigma_22)
-    grad_energy_term = (KAPPA * laplacian(c, pos, pos_diff))
-    return KBT * mu_h - grad_energy_term - stress_term # per royal's note unnormalize mu_h by * KBT
+    # BETA is a molar eigenstrain coefficient (m^3/mol); BETA*sigma is J/mol, so divide by
+    # N_A to get a per-particle energy matching KBT*mu_h
+    stress_term = (BETA_a * sigma_11 + BETA_c * sigma_22) / N_A
+    # pos_diff is in micrometers but KAPPA is given in J/m, so convert to meters for the
+    # Laplacian
+    # KAPPA*laplacian(c) is then an energy density (J/m^3), so divide by the
+    # lithium-site number density (C_MAX * N_A, sites/m^3) to get a per-particle energy
+    pos_diff_m = pos_diff * UM_TO_M
+    grad_energy_term = (KAPPA * laplacian(c, pos, pos_diff_m)) / (C_MAX * N_A)
+    homogeneous_term = KBT * mu_h
+    return homogeneous_term - grad_energy_term - stress_term # per royal's note unnormalize mu_h by * KBT
 
-def get_eta(mu):
+def get_eta(mu, mu_res):
     """mu is already dimensionless (mu_h is nondimensionalized by KBT per the paper,
     and the gradient/stress corrections are small perturbations on that same scale)"""
-    return mu - MU_RES
+    return (mu - mu_res) / KBT
 
 def get_allen_cahn_res(c, tau, eta, t_diff, k, j_0):
     dc_dtau = compute_time_derivs(c, tau)
@@ -484,13 +566,13 @@ def get_allen_cahn_res(c, tau, eta, t_diff, k, j_0):
     return  dc_dt - rhs_1
 
 
-def get_residuals(c, c_0, epsilon, k, j_0, tau, t_diff, pos, pos_diff):
+def get_residuals(c, c_0, epsilon, k, j_0, tau, t_diff, pos, pos_diff, mu_res):
     sigma = stress_strain_eq(c, c_0, epsilon)
-    force_balance_res = force_balance(sigma, pos, pos_diff)
+    force_balance_res = force_balance(sigma, pos)
 
     mu_h = get_mu_h(c)
     mu = get_mu(mu_h, c, sigma, pos, pos_diff)
-    eta = get_eta(mu)
+    eta = get_eta(mu, mu_res)
     allen_cahn_res = get_allen_cahn_res(c, tau, eta, t_diff, k, j_0)
 
     return allen_cahn_res, force_balance_res
@@ -509,7 +591,7 @@ def collocation_residual_magnitude(model, xy_tau, t_diff):
     c_0 = model(torch.cat([pos, tau0], dim=1))[:, 0:1]
 
     allen_cahn_res, force_balance_res = get_residuals(
-        c_pred, c_0, eps_pred, k_pred, j_0_pred, tau, t_diff, pos, POS_DIFF)
+        c_pred, c_0, eps_pred, k_pred, j_0_pred, tau, t_diff, pos, POS_DIFF, model.mu_res)
 
     combined = torch.cat([allen_cahn_res, force_balance_res], dim=1)
     return combined.pow(2).sum(dim=1).sqrt().detach()
@@ -531,25 +613,6 @@ def adaptive_rad_sample(model, x_vals_np, y_vals_np, n_points, t_diff, tau_max=T
     return candidates[idx].detach().cpu().numpy()
 
 # ======= loss =======
-
-LOSS_TERM_NAMES = ['c', 'e11', 'e22', 'e12', 'allen_cahn', 'force_balance', 'k_reg']
-INTERP_TERM_NAMES = ['interp_c', 'interp_e11', 'interp_e22', 'interp_e12']
-
-ALL_TERM_NAMES = LOSS_TERM_NAMES + INTERP_TERM_NAMES
-
-DEFAULT_LAMBDAS = {
-    'c': 1.0,
-    'e11': 1.0,
-    'e22': 1.0,
-    'e12': 1.0,
-    'allen_cahn': 100.0,
-    'force_balance': 100.0,
-    'k_reg': 1e-3,
-    'interp_c': 0.1,
-    'interp_e11': 0.1,
-    'interp_e22': 0.1,
-    'interp_e12': 0.1,
-}
 
 def get_data_loss_terms(c_pred, c_true, eps_pred_scaled, eps_true):
     """using plain epsilon scaling: compares the model's already-scaled eps
@@ -598,7 +661,7 @@ def pinn_loss(
         c_pred, c_true, eps_pred_scaled, eps_true)
 
     allen_cahn_res, force_balance_res = get_residuals(c_pred, c_0, eps_pred, k_pred, j_0_pred,
-                                                      tau, t_diff, pos_data, POS_DIFF)
+                                                      tau, t_diff, pos_data, POS_DIFF, model.mu_res)
 
     # physics residual is also enforced on RAD collocation points sampled
     # across the full space-time domain (physics-only, no labels)
@@ -617,7 +680,7 @@ def pinn_loss(
 
         allen_cahn_res_c, force_balance_res_c = get_residuals(
             c_pred_c, c_0_c, eps_pred_c, k_pred_c, j_0_pred_c,
-            colloc_tau, t_diff, colloc_pos, POS_DIFF)
+            colloc_tau, t_diff, colloc_pos, POS_DIFF, model.mu_res)
 
         allen_cahn_res = torch.cat([allen_cahn_res, allen_cahn_res_c], dim=0)
         force_balance_res = torch.cat([force_balance_res, force_balance_res_c], dim=0)
@@ -670,12 +733,12 @@ def pinn_loss(
 def compute_term_grad_norms(model, in_data, labels, t_diff, collocation_data=None):
     """L2 norm of each (unweighted) loss term's gradient w.r.t. model params;
     used for Wang et al. (2021) esque adaptive loss balancing. Restricted to
-    LOSS_TERM_NAMES"""
+    REBALANCED_TERM_NAMES"""
     unit_lambdas = {name: 1.0 for name in ALL_TERM_NAMES}
     __, loss_terms = pinn_loss(model, in_data, labels, t_diff, unit_lambdas, collocation_data)
     params = list(model.parameters())
     grad_norms = {}
-    for name in LOSS_TERM_NAMES:
+    for name in REBALANCED_TERM_NAMES:
         grads = torch.autograd.grad(
             loss_terms[name], params, retain_graph=True, allow_unused=True)
         sq_norms = [g.pow(2).sum() for g in grads if g is not None]
@@ -686,12 +749,35 @@ def compute_term_grad_norms(model, in_data, labels, t_diff, collocation_data=Non
 def rebalance_lambdas(lambdas, grad_norms, alpha=GRAD_NORM_EMA_ALPHA, eps=1e-8, lambda_max=1e3):
     reference = max(grad_norms[name] for name in ('c', 'e11', 'e22', 'e12'))
     new_lambdas = dict(lambdas)
-    for name in LOSS_TERM_NAMES:
+    for name in REBALANCED_TERM_NAMES:
         target = min(reference / (grad_norms[name] + eps), lambda_max)
         new_lambdas[name] = (1 - alpha) * lambdas[name] + alpha * target
     return new_lambdas
 
 # ======= train + eval ======
+
+K_STATS_EVERY = 10
+
+
+def k_output_stats(model, x_vals_np, y_vals_np):
+    """std/min/max of the model's predicted k(x, y) over the full domain grid, so
+    checkpoint selection's blindness to k quality (it only sees a 1e-3-weighted
+    k_reg term, not k's actual spread) can be diagnosed from logged history instead
+    of guessed at after the fact; k is tau-independent (netB only sees position) so
+    tau is fixed to 0"""
+    tau = np.zeros_like(x_vals_np)
+    xy_tau = np.stack([x_vals_np, y_vals_np, tau], axis=1)
+    was_training = model.training
+    param_dtype = next(model.parameters()).dtype
+    model.eval()
+    with torch.no_grad():
+        inputs = normalize_model_input(
+            torch.from_numpy(xy_tau).to(device=device, dtype=param_dtype))
+        k_pred = model(inputs)[:, 4]
+    if was_training:
+        model.train()
+    return k_pred.std().item(), k_pred.min().item(), k_pred.max().item()
+
 
 def eval_pinn(model, data_loader, lambdas=DEFAULT_LAMBDAS, collocation_data=None):
     n = 0
@@ -734,6 +820,9 @@ def train_pinn_adam_only(model, adam_loader, interp_data_loader, lambdas=DEFAULT
     per_epoch_lambdas = {name: np.zeros(adam_epochs) for name in ALL_TERM_NAMES}
     per_epoch_test_total = np.zeros(adam_epochs)
     per_epoch_test_terms = {name: np.zeros(adam_epochs) for name in ALL_TERM_NAMES}
+    per_epoch_k_std = np.zeros(adam_epochs)
+    per_epoch_k_min = np.zeros(adam_epochs)
+    per_epoch_k_max = np.zeros(adam_epochs)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(adam_epochs, 1), eta_min=COSINE_ETA_MIN)
@@ -745,8 +834,9 @@ def train_pinn_adam_only(model, adam_loader, interp_data_loader, lambdas=DEFAULT
     interp_iter = iter(interp_data_loader) if interp_data_loader is not None else None
 
     for epoch in range(adam_epochs):
-        iter_total_loss = 0.0
-        iter_term_sums = {name: 0.0 for name in ALL_TERM_NAMES}
+
+        iter_total_loss = torch.zeros((), device=device)
+        iter_term_sums = {name: torch.zeros((), device=device) for name in ALL_TERM_NAMES}
         n = 0
 
         if epoch == 0 or epoch % RAD_RESAMPLE_EVERY == 0:
@@ -785,20 +875,27 @@ def train_pinn_adam_only(model, adam_loader, interp_data_loader, lambdas=DEFAULT
             loss.backward()
             optimizer.step()
             n += 1
-            iter_total_loss += loss.item()
+            iter_total_loss += loss.detach()
             for name in ALL_TERM_NAMES:
-                iter_term_sums[name] += loss_terms[name].item()
+                iter_term_sums[name] += loss_terms[name].detach()
 
         scheduler.step()
 
-        iter_total_loss /= n
+        iter_total_loss = (iter_total_loss / n).item()
         for name in ALL_TERM_NAMES:
-            iter_term_sums[name] /= n
+            iter_term_sums[name] = (iter_term_sums[name] / n).item()
 
         per_epoch_total[epoch] = iter_total_loss
         for name in ALL_TERM_NAMES:
             per_epoch_terms[name][epoch] = iter_term_sums[name]
             per_epoch_lambdas[name][epoch] = step_lambdas[name]
+        if epoch % K_STATS_EVERY == 0:
+            per_epoch_k_std[epoch], per_epoch_k_min[epoch], per_epoch_k_max[epoch] = (
+                k_output_stats(model, x_vals_np, y_vals_np))
+        else:
+            per_epoch_k_std[epoch] = per_epoch_k_std[epoch - 1]
+            per_epoch_k_min[epoch] = per_epoch_k_min[epoch - 1]
+            per_epoch_k_max[epoch] = per_epoch_k_max[epoch - 1]
 
         if test_loader is not None:
             test_total_loss, test_term_sums = eval_pinn(model, test_loader, step_lambdas)
@@ -811,7 +908,11 @@ def train_pinn_adam_only(model, adam_loader, interp_data_loader, lambdas=DEFAULT
         else:
             ckpt_loss = sum(DEFAULT_LAMBDAS[name] * iter_term_sums[name] for name in ALL_TERM_NAMES)
 
-        if ckpt_loss < best_loss:
+        # a checkpoint only becomes eligible for "best" once the lambdas have been
+        # rebalanced at least once; before that the network is close to random init,
+        # and a near-constant output can score deceptively well against the single
+        # held-out (extrapolation) test slice purely by chance, not genuine fit
+        if epoch >= GRAD_NORM_REBALANCE_EVERY and ckpt_loss < best_loss:
             best_loss = ckpt_loss
             epochs_since_improvement = 0
             torch.save(model.state_dict(), os.path.join(model_dir, 'best_model.pt'))
@@ -835,34 +936,32 @@ def train_pinn_adam_only(model, adam_loader, interp_data_loader, lambdas=DEFAULT
     else:
         adam_epochs_run = adam_epochs
 
+    if best_loss == float('inf'):
+        # adam_epochs was too short to clear the GRAD_NORM_REBALANCE_EVERY floor above,
+        # so no checkpoint was ever saved this run; fall back to the final weights so
+        # best_model.pt always reflects this run instead of silently reusing a stale
+        # file left over from a previous experiment
+        torch.save(model.state_dict(), os.path.join(model_dir, 'best_model.pt'))
+
     per_epoch_total = per_epoch_total[:adam_epochs_run]
     per_epoch_terms = {name: arr[:adam_epochs_run] for name, arr in per_epoch_terms.items()}
     per_epoch_lambdas = {name: arr[:adam_epochs_run] for name, arr in per_epoch_lambdas.items()}
     per_epoch_test_total = per_epoch_test_total[:adam_epochs_run]
     per_epoch_test_terms = {name: arr[:adam_epochs_run] for name, arr in per_epoch_test_terms.items()}
+    per_epoch_k_stats = {
+        'std': per_epoch_k_std[:adam_epochs_run],
+        'min': per_epoch_k_min[:adam_epochs_run],
+        'max': per_epoch_k_max[:adam_epochs_run],
+    }
 
     return (best_loss, per_epoch_total, per_epoch_terms, per_epoch_lambdas, per_epoch_test_total,
-            per_epoch_test_terms, adam_epochs_run)
+            per_epoch_test_terms, adam_epochs_run, per_epoch_k_stats)
 
 
 def train_pinn_qn(model, qn_inputs, qn_labels, interp_inputs, interp_labels, lambdas,
                    x_vals_np, y_vals_np, model_dir, test_loader=None, qn_method=QN_METHOD,
                    max_iters=QN_MAX_ITERS, change_every=QN_CHANGE_EVERY,
                    patience=EARLY_STOP_PATIENCE_QN):
-    """Second-order fine-tuning phase on a GPU-native self-scaled BFGS/Broyden
-    optimizer (ssbfgs_pytorch), run after train_pinn_adam_only. qn_inputs/
-    qn_labels/interp_inputs/interp_labels are a single fixed full batch each
-    (see full_batch_loader) -- the objective must stay deterministic across
-    the many closure evaluations a line search performs, so nothing here is
-    reshuffled per-call the way Adam's minibatches are. Only the RAD
-    collocation pool and the lambda weights are refreshed, every
-    change_every iterations (mirrors v3's NCHANGE chunking).
-
-    Runs in float64: model, lambdas rebalancing, and the physics globals
-    (POS_MIN/POS_DIFF/EPS_LEARN_SCALE/C_EQV) are all switched to double
-    precision for the duration and restored to float32 on return, matching
-    v3's BFGS phase.
-    """
     lambdas = dict(lambdas)
 
     global POS_MIN, POS_DIFF, EPS_LEARN_SCALE, C_EQV
@@ -879,11 +978,7 @@ def train_pinn_qn(model, qn_inputs, qn_labels, interp_inputs, interp_labels, lam
     colloc_pool_np = adaptive_rad_sample(model, x_vals_np, y_vals_np, BFGS_BATCH, T_DIFF)
     collocation_data = torch.from_numpy(colloc_pool_np).to(device=device, dtype=torch.float64)
 
-    # smooth handoff from Adam's weights via the normal EMA rebalance, not a
-    # hard alpha=1.0 jump: v3's abrupt pre-BFGS rebalance instantly
-    # re-anchored the objective to a very different weighting right as BFGS
-    # took over, which is implicated in how fast v3's BFGS phase went on to
-    # overfit (see the v3 lambda-history analysis)
+  
     grad_norms = compute_term_grad_norms(model, qn_inputs, qn_labels, T_DIFF, collocation_data)
     lambdas = rebalance_lambdas(lambdas, grad_norms)
 
@@ -909,6 +1004,9 @@ def train_pinn_qn(model, qn_inputs, qn_labels, interp_inputs, interp_labels, lam
     per_iter_lambdas = {name: np.zeros(max_iters) for name in ALL_TERM_NAMES}
     per_iter_test_total = np.zeros(max_iters)
     per_iter_test_terms = {name: np.zeros(max_iters) for name in ALL_TERM_NAMES}
+    per_iter_k_std = np.zeros(max_iters)
+    per_iter_k_min = np.zeros(max_iters)
+    per_iter_k_max = np.zeros(max_iters)
 
     term_sink = {}
 
@@ -932,8 +1030,7 @@ def train_pinn_qn(model, qn_inputs, qn_labels, interp_inputs, interp_labels, lam
         except RuntimeError as exc:
             if 'strong-Wolfe line search failed' not in str(exc):
                 raise
-            # same recovery as Helmholtz.py: preserve the accepted iterate,
-            # resample collocation, and reset the line search's step-size memory
+
             print(f'QN iter {it}: strong-Wolfe search exhausted; resampling collocation and continuing.')
             colloc_pool_np = adaptive_rad_sample(model, x_vals_np, y_vals_np, BFGS_BATCH, T_DIFF)
             collocation_data = torch.from_numpy(colloc_pool_np).to(device=device, dtype=torch.float64)
@@ -945,6 +1042,13 @@ def train_pinn_qn(model, qn_inputs, qn_labels, interp_inputs, interp_labels, lam
         for name in ALL_TERM_NAMES:
             per_iter_terms[name][it] = term_sink[name]
             per_iter_lambdas[name][it] = lambdas[name]
+        if it % K_STATS_EVERY == 0:
+            per_iter_k_std[it], per_iter_k_min[it], per_iter_k_max[it] = (
+                k_output_stats(model, x_vals_np, y_vals_np))
+        else:
+            per_iter_k_std[it] = per_iter_k_std[it - 1]
+            per_iter_k_min[it] = per_iter_k_min[it - 1]
+            per_iter_k_max[it] = per_iter_k_max[it - 1]
 
         if test_loader is not None:
             test_total_loss, test_term_sums = eval_pinn(model, test_loader, lambdas)
@@ -952,9 +1056,7 @@ def train_pinn_qn(model, qn_inputs, qn_labels, interp_inputs, interp_labels, lam
             per_iter_test_total[it] = test_total_loss
             for name in ALL_TERM_NAMES:
                 per_iter_test_terms[name][it] = test_term_sums[name]
-            # fixed DEFAULT_LAMBDAS weighting for checkpoint selection, same
-            # reasoning as train_pinn_adam_only: comparing against the live
-            # rebalanced lambdas lets a reweighting masquerade as a loss change
+            # fixed DEFAULT_LAMBDAS weighting for checkpoint selection
             ckpt_loss = sum(DEFAULT_LAMBDAS[name] * test_term_sums[name] for name in ALL_TERM_NAMES)
         else:
             ckpt_loss = sum(DEFAULT_LAMBDAS[name] * term_sink[name] for name in ALL_TERM_NAMES)
@@ -991,19 +1093,24 @@ def train_pinn_qn(model, qn_inputs, qn_labels, interp_inputs, interp_labels, lam
     per_iter_lambdas = {name: arr[:n_iters_run] for name, arr in per_iter_lambdas.items()}
     per_iter_test_total = per_iter_test_total[:n_iters_run]
     per_iter_test_terms = {name: arr[:n_iters_run] for name, arr in per_iter_test_terms.items()}
+    per_iter_k_stats = {
+        'std': per_iter_k_std[:n_iters_run],
+        'min': per_iter_k_min[:n_iters_run],
+        'max': per_iter_k_max[:n_iters_run],
+    }
 
     model.float()
     POS_MIN, POS_DIFF = POS_MIN.float(), POS_DIFF.float()
     EPS_LEARN_SCALE, C_EQV = EPS_LEARN_SCALE.float(), C_EQV.float()
 
     return (best_loss, per_iter_total, per_iter_terms, per_iter_lambdas, per_iter_test_total,
-            per_iter_test_terms, n_iters_run)
+            per_iter_test_terms, n_iters_run, per_iter_k_stats)
 
 # ====== for plotting ========
 
 
 def save_loss_csv(per_step_total, per_step_terms, per_step_lambdas, results_dir=RESULTS_DIR,
-                   adam_epochs=NEPOCHS_ADAM, test_total=None, test_terms=None):
+                   adam_epochs=NEPOCHS_ADAM, test_total=None, test_terms=None, k_stats=None):
     os.makedirs(results_dir, exist_ok=True)
     steps = np.arange(len(per_step_total))
     phase = np.where(steps < adam_epochs, 'adam', 'bfgs')
@@ -1015,6 +1122,10 @@ def save_loss_csv(per_step_total, per_step_terms, per_step_lambdas, results_dir=
         data['test_total_loss'] = test_total
         for name in ALL_TERM_NAMES:
             data[f'test_{name}_loss'] = test_terms[name]
+    if k_stats is not None:
+        data['k_std'] = k_stats['std']
+        data['k_min'] = k_stats['min']
+        data['k_max'] = k_stats['max']
     df = pd.DataFrame(data)
     df.to_csv(os.path.join(results_dir, 'loss_history.csv'), index=False)
 
@@ -1022,51 +1133,6 @@ def save_loss_csv(per_step_total, per_step_terms, per_step_lambdas, results_dir=
     for name in ALL_TERM_NAMES:
         lambda_data[f'{name}_lambda'] = per_step_lambdas[name]
     pd.DataFrame(lambda_data).to_csv(os.path.join(results_dir, 'lambda_history.csv'), index=False)
-
-
-def save_pointwise_c_error(model, num_test_slices=1, data_path=CONCENTRATION_CSV_PATH,
-                          results_dir=RESULTS_DIR):
-    _, _, test_in_np, test_out_np = extract_c_data(data_path, num_test_slices)
-    x = test_in_np[:NUM_POS, 0]
-    y = test_in_np[:NUM_POS, 1]
-
-    model.eval()
-    cols = {'x': x, 'y': y}
-    with torch.no_grad():
-        for i in range(num_test_slices):
-            slice_in = test_in_np[i * NUM_POS:(i + 1) * NUM_POS]
-            slice_true = test_out_np[i * NUM_POS:(i + 1) * NUM_POS].squeeze()
-            inputs = normalize_model_input(torch.from_numpy(slice_in).to(device))
-            outputs = model(inputs)
-            c_pred = outputs[:, 0].cpu().numpy()
-            t_val = TIME_SLICES[NUM_T_STATES - num_test_slices + i]
-            cols[f'c_abs_error_t{t_val}'] = np.abs(c_pred - slice_true)
-
-    os.makedirs(results_dir, exist_ok=True)
-    pd.DataFrame(cols).to_csv(os.path.join(results_dir, 'pointwise_c_error.csv'), index=False)
-
-def save_pointwise_e_error(model, num_test_slices=1, data_path=STRAIN_CSV_PATH,
-                          results_dir=RESULTS_DIR):
-    _, _, test_in_np, test_out_np = extract_strain_data(data_path, num_test_slices)
-    x = test_in_np[:NUM_POS, 0]
-    y = test_in_np[:NUM_POS, 1]
-
-    model.eval()
-    cols = {'x': x, 'y': y}
-    with torch.no_grad():
-        for i in range(num_test_slices):
-            slice_in = test_in_np[i * NUM_POS:(i + 1) * NUM_POS]
-            slice_true = test_out_np[i * NUM_POS:(i + 1) * NUM_POS].squeeze()
-            inputs = normalize_model_input(torch.from_numpy(slice_in).to(device))
-            outputs = model(inputs)
-            t_val = TIME_SLICES[NUM_T_STATES - num_test_slices + i]
-            for j in range(3):
-                e_pred = (outputs[:, j+1] / EPS_LEARN_SCALE[j]).cpu().numpy()
-                e_true = slice_true[:, j]
-                cols[f'e{EPS_IDX[j]}_abs_error_t{t_val}'] = np.abs(e_pred - e_true)
-
-    os.makedirs(results_dir, exist_ok=True)
-    pd.DataFrame(cols).to_csv(os.path.join(results_dir, 'pointwise_e_error.csv'), index=False)
 
 
 def save_preds(model, field_idx, data_path=CONCENTRATION_CSV_PATH,
@@ -1094,19 +1160,91 @@ def save_preds(model, field_idx, data_path=CONCENTRATION_CSV_PATH,
     os.makedirs(results_dir, exist_ok=True)
     pd.DataFrame(cols).to_csv(os.path.join(results_dir, f'pred_{pred_field}.csv'), index=False)
 
+
+def save_mu_h_preds(model, data_path=CONCENTRATION_CSV_PATH, results_dir=RESULTS_DIR):
+    """mu_h is not a network output; it's get_mu_h applied to the model's own c
+    prediction, same as it's used inside the Allen-Cahn residual during training"""
+    in_data, _, _, _ = extract_c_data(data_path, num_test_slices=0)
+    x = in_data[:NUM_POS, 0]
+    y = in_data[:NUM_POS, 1]
+
+    model.eval()
+    cols = {'x': x, 'y': y}
+    with torch.no_grad():
+        for i in range(NUM_T_STATES):
+            slice_in = in_data[i * NUM_POS:(i + 1) * NUM_POS]
+            inputs = normalize_model_input(torch.from_numpy(slice_in).to(device))
+            c_pred = model(inputs)[:, 0:1]
+            mu_h_pred = get_mu_h(c_pred).squeeze(1).cpu().numpy()
+            t_val = TIME_SLICES[i]
+            cols[f'pred_mu_h{t_val}'] = mu_h_pred
+
+    os.makedirs(results_dir, exist_ok=True)
+    pd.DataFrame(cols).to_csv(os.path.join(results_dir, 'pred_mu_h.csv'), index=False)
+
+
+def save_k_at_grf_points(model, grf_path=GRF_K_CSV_PATH, results_dir=RESULTS_DIR):
+    """evaluates the model's k(x, y) at the GT GRF field's own (x, y) points (a
+    different, denser grid than the training positions) for a pointwise comparison"""
+    df = pd.read_csv(grf_path)
+    x = df['x'].to_numpy().astype(np.float32)
+    y = df['y'].to_numpy().astype(np.float32)
+    grf_k = df['grf_interpolated'].to_numpy().astype(np.float32)
+    tau = np.zeros_like(x)  # k(x, y) is tau-independent (netB only sees position)
+    xy_tau = np.stack([x, y, tau], axis=1)
+
+    model.eval()
+    with torch.no_grad():
+        inputs = normalize_model_input(torch.from_numpy(xy_tau).to(device))
+        k_pred = model(inputs)[:, 4].cpu().numpy()
+
+    os.makedirs(results_dir, exist_ok=True)
+    pd.DataFrame({'x': x, 'y': y, 'grf_interpolated': grf_k, 'pred_k': k_pred}).to_csv(
+        os.path.join(results_dir, 'k_grf_comparison.csv'), index=False)
+
+
+def save_mu_h_j0_at_gt_c(model, data_path=CONCENTRATION_CSV_PATH, results_dir=RESULTS_DIR):
+    """evaluates mu_h (a closed-form function of c) and j_0 (via netC, which takes only
+    c as input) directly at the GT concentration values instead of the model's own
+    predicted c, isolating the learned/assumed c-dependent relationships from any noise
+    in the model's own concentration fit -- for a cleaner comparison against chem.csv's
+    and identified_j0_curve.csv's reference curves"""
+    in_data, out_data, _, _ = extract_c_data(data_path, num_test_slices=0)
+    x = in_data[:NUM_POS, 0]
+    y = in_data[:NUM_POS, 1]
+
+    model.eval()
+    cols = {'x': x, 'y': y}
+    with torch.no_grad():
+        for i in range(NUM_T_STATES):
+            c_true = torch.from_numpy(out_data[i * NUM_POS:(i + 1) * NUM_POS]).to(device)
+            mu_h_at_gt_c = get_mu_h(c_true).squeeze(1).cpu().numpy()
+            log_f = model.netC(c_true)
+            j0_at_gt_c = (c_true * (1 - c_true) * torch.exp(log_f)).squeeze(1).cpu().numpy()
+            t_val = TIME_SLICES[i]
+            cols[f'gt_c{t_val}'] = out_data[i * NUM_POS:(i + 1) * NUM_POS].squeeze(1)
+            cols[f'mu_h_at_gt_c{t_val}'] = mu_h_at_gt_c
+            cols[f'j0_at_gt_c{t_val}'] = j0_at_gt_c
+
+    os.makedirs(results_dir, exist_ok=True)
+    pd.DataFrame(cols).to_csv(os.path.join(results_dir, 'mu_h_j0_at_gt_c.csv'), index=False)
+
 # ======= main =======
 
 
 def main():
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
+    torch.manual_seed(1)
+    torch.cuda.manual_seed_all(1)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
     adam_train_loader, test_loader = load_data()
     interp_train_loader = interp_loader()
 
     netA = PINN(in_channels=IN_CH_ONE, out_channels=OUT_CH_ONE)
     netB = PINN(in_channels=IN_CH_TWO, out_channels=OUT_CH_TWO)
-    netC = PINN(in_channels=IN_CH_THREE, out_channels=OUT_CH_THREE)
+    netC = PINN(in_channels=IN_CH_THREE, out_channels=OUT_CH_THREE, width=NETC_WIDTH, depth=NETC_DEPTH)
 
     pinn = AllenCahnPINN(netA, netB, netC).to(device)
 
@@ -1114,16 +1252,15 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     (best_loss, per_step_total, per_step_terms, per_step_lambdas, per_step_test_total,
-     per_step_test_terms, adam_epochs_run) = train_pinn_adam_only(
+     per_step_test_terms, adam_epochs_run, per_step_k_stats) = train_pinn_adam_only(
         model=pinn, adam_loader=adam_train_loader, interp_data_loader=interp_train_loader,
         lambdas=DEFAULT_LAMBDAS, adam_epochs=NEPOCHS_ADAM,
         lr=LR, model_dir=MODEL_DIR, test_loader=test_loader,
         disable_early_stop=True,
     )
 
-    # hand the QN phase Adam's best checkpoint (by the fixed-lambda ckpt_loss),
-    # not necessarily its last epoch -- disable_early_stop=True runs Adam the
-    # full NEPOCHS_ADAM regardless of where it actually peaked
+    # hand the QN phase Adam's best checkpoint (by the fixed-lambda ckpt_loss)
+    # not necessarily its last epoch 
     pinn.load_state_dict(torch.load(os.path.join(MODEL_DIR, 'best_model.pt')))
     adam_final_lambdas = {name: float(per_step_lambdas[name][-1]) for name in ALL_TERM_NAMES}
 
@@ -1133,11 +1270,14 @@ def main():
     x_vals_np, y_vals_np = load_domain_xy()
 
     (qn_best_loss, qn_per_iter_total, qn_per_iter_terms, qn_per_iter_lambdas,
-     qn_per_iter_test_total, qn_per_iter_test_terms, qn_iters_run) = train_pinn_qn(
+     qn_per_iter_test_total, qn_per_iter_test_terms, qn_iters_run, qn_per_iter_k_stats) = train_pinn_qn(
         model=pinn, qn_inputs=qn_inputs, qn_labels=qn_labels,
         interp_inputs=interp_inputs, interp_labels=interp_labels,
         lambdas=adam_final_lambdas, x_vals_np=x_vals_np, y_vals_np=y_vals_np,
         model_dir=MODEL_DIR, test_loader=test_loader,
+        # patience >= max_iters makes epochs_since_improvement unreachable within
+        # the loop, i.e. no early stop -- run the full QN budget regardless
+        patience=QN_MAX_ITERS,
     )
 
     combined_total = np.concatenate([per_step_total, qn_per_iter_total])
@@ -1148,17 +1288,21 @@ def main():
     combined_test_total = np.concatenate([per_step_test_total, qn_per_iter_test_total])
     combined_test_terms = {name: np.concatenate([per_step_test_terms[name], qn_per_iter_test_terms[name]])
                             for name in ALL_TERM_NAMES}
+    combined_k_stats = {stat: np.concatenate([per_step_k_stats[stat], qn_per_iter_k_stats[stat]])
+                         for stat in ('std', 'min', 'max')}
 
     save_loss_csv(combined_total, combined_terms, combined_lambdas, adam_epochs=adam_epochs_run,
-                  test_total=combined_test_total, test_terms=combined_test_terms)
+                  test_total=combined_test_total, test_terms=combined_test_terms,
+                  k_stats=combined_k_stats)
 
     pinn.load_state_dict(torch.load(os.path.join(MODEL_DIR, 'best_model.pt')))
     total_eval_loss, __ = eval_pinn(pinn, test_loader, DEFAULT_LAMBDAS)
 
-    save_pointwise_c_error(pinn)
-    save_pointwise_e_error(pinn)
     for i in range(6):
         save_preds(pinn, i)
+    save_mu_h_preds(pinn)
+    save_k_at_grf_points(pinn)
+    save_mu_h_j0_at_gt_c(pinn)
 
 
 if __name__ == "__main__":

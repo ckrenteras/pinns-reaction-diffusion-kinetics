@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -7,6 +8,7 @@ PLOTS_DIR = os.path.join(RESULTS_DIR, 'plots')
 DATA_PATH = os.path.join('.', 'data', 'Ihuaenyi_concentration_data.csv')
 STRAIN_DATA_PATH = os.path.join('.', 'data', 'Ihuaenyi_strain_data.csv')
 IDENTIFIED_J0_PATH = os.path.join('.', 'data', 'identified_j0_curve.csv')
+CHEM_DATA_PATH = os.path.join('.', 'data', 'chem.csv')
 
 TIMES = [0, 16, 30, 43, 63, 71]
 
@@ -26,11 +28,12 @@ LOSS_TERM_LABELS = {
 }
 
 
-def plot_loss_history(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
+def plot_loss_history(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR, exclude_prefixes=(),
+                       save_name='loss_history.png'):
     df = pd.read_csv(os.path.join(results_dir, 'loss_history.csv'))
     fig, ax = plt.subplots(figsize=(9, 5))
     for col, label in LOSS_TERM_LABELS.items():
-        if col in df.columns:
+        if col in df.columns and not col.startswith(exclude_prefixes):
             ax.semilogy(df['step'], df[col], label=label)
     ax.semilogy(df['step'], df['total_loss'], label='Total loss', linestyle='--', color='black')
     ax.set_xlabel('Step (1 pt/epoch, Adam only)')
@@ -39,8 +42,15 @@ def plot_loss_history(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
     ax.grid(True, which='both', alpha=0.3)
     fig.tight_layout()
     os.makedirs(plots_dir, exist_ok=True)
-    fig.savefig(os.path.join(plots_dir, 'loss_history.png'), dpi=150)
+    fig.savefig(os.path.join(plots_dir, save_name), dpi=150)
     plt.close(fig)
+
+
+def plot_loss_history_no_interp(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
+    """same as plot_loss_history but omits the interp_* pseudo-data terms, which are
+    always the smallest/densest cluster of lines and mostly just add clutter"""
+    plot_loss_history(results_dir, plots_dir, exclude_prefixes=('interp_',),
+                       save_name='loss_history_no_interp.png')
 
 
 TRAIN_TEST_TERMS = ['c', 'e11', 'e12', 'e22']
@@ -83,65 +93,6 @@ def plot_lambda_history(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
     fig.tight_layout()
     os.makedirs(plots_dir, exist_ok=True)
     fig.savefig(os.path.join(plots_dir, 'lambda_history.png'), dpi=150)
-    plt.close(fig)
-
-
-def plot_pointwise_error(plot_val, results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
-    if plot_val not in ['c', 'e11', 'e12', 'e22']:
-        raise ValueError('Invalid plot value requested')
-    error_file = 'pointwise_c_error.csv' if plot_val == 'c' else 'pointwise_e_error.csv'
-    df = pd.read_csv(os.path.join(results_dir, error_file))
-    prefix = f'{plot_val}_abs_error_t'
-    error_cols = [c for c in df.columns if c.startswith(prefix)]
-    n = len(error_cols)
-    ncols = min(3, n)
-    nrows = (n + ncols - 1) // ncols
-
-    fig, axs = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows),
-                             squeeze=False)
-    for idx, col in enumerate(error_cols):
-        r, c = divmod(idx, ncols)
-        ax = axs[r][c]
-        sc = ax.scatter(df['x'], df['y'], c=df[col], cmap='hot_r', s=20)
-        ax.set_xlabel('X [μm]')
-        ax.set_ylabel('Y [μm]')
-        cbar = fig.colorbar(sc, ax=ax)
-        cbar.set_label(f'|{plot_val}_pred − {plot_val}_true|')
-
-    for idx in range(n, nrows * ncols):
-        r, c = divmod(idx, ncols)
-        axs[r][c].set_visible(False)
-
-    fig.tight_layout()
-    os.makedirs(plots_dir, exist_ok=True)
-    fig.savefig(os.path.join(plots_dir, f'pointwise_{plot_val}_error.png'), dpi=150,
-                bbox_inches='tight')
-    plt.close(fig)
-
-def plot_pointwise_error_combined(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
-    df_c = pd.read_csv(os.path.join(results_dir, 'pointwise_c_error.csv'))
-    df_e = pd.read_csv(os.path.join(results_dir, 'pointwise_e_error.csv'))
-
-    panels = [
-        ('c', df_c, 'c_abs_error_t71', '|c_pred − c_true|'),
-        ('e11', df_e, 'e11_abs_error_t71', '|e11_pred − e11_true|'),
-        ('e12', df_e, 'e12_abs_error_t71', '|e12_pred − e12_true|'),
-        ('e22', df_e, 'e22_abs_error_t71', '|e22_pred − e22_true|'),
-    ]
-
-    fig, axs = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4.5), squeeze=False)
-    for ax, (name, df, col, cbar_label) in zip(axs[0], panels):
-        sc = ax.scatter(df['x'], df['y'], c=df[col], cmap='hot_r', s=20)
-        ax.set_title(f'Pointwise Abs Error: {name} (t = 71)')
-        ax.set_xlabel('X [μm]')
-        ax.set_ylabel('Y [μm]')
-        cbar = fig.colorbar(sc, ax=ax)
-        cbar.set_label(cbar_label)
-
-    fig.tight_layout()
-    os.makedirs(plots_dir, exist_ok=True)
-    fig.savefig(os.path.join(plots_dir, 'pointwise_error_combined.png'), dpi=150,
-                bbox_inches='tight')
     plt.close(fig)
 
 
@@ -226,23 +177,35 @@ def _plot_comparison_grid(x_gt, y_gt, gt_cols_data, x_pred, y_pred, pred_cols_da
     vmin = min(gt_cols_data.min().min(), pred_cols_data.min().min())
     vmax = max(gt_cols_data.max().max(), pred_cols_data.max().max())
 
+    # gt_cols_data/pred_cols_data share the same underlying point grid and column
+    # (time) order, so a straight elementwise diff gives the pointwise error
+    abs_error = np.abs(pred_cols_data.to_numpy() - gt_cols_data.to_numpy())
+    err_vmax = abs_error.max()
+
     n = len(times)
-    fig, axs = plt.subplots(2, n, figsize=(4 * n, 8), squeeze=False)
+    fig, axs = plt.subplots(3, n, figsize=(4 * n, 12), squeeze=False)
     for j, t in enumerate(times):
         sc = axs[0][j].scatter(x_gt, y_gt, c=gt_cols_data.iloc[:, j],
                                 cmap='viridis', s=20, vmin=vmin, vmax=vmax)
         axs[1][j].scatter(x_pred, y_pred, c=pred_cols_data.iloc[:, j],
                            cmap='viridis', s=20, vmin=vmin, vmax=vmax)
+        err_sc = axs[2][j].scatter(x_pred, y_pred, c=abs_error[:, j],
+                                    cmap='hot_r', s=20, vmin=0, vmax=err_vmax)
         axs[0][j].set_title(f't = {t}')
-        for ax in (axs[0][j], axs[1][j]):
+        for ax in (axs[0][j], axs[1][j], axs[2][j]):
             ax.set_xlabel('X [μm]')
     axs[0][0].set_ylabel('Ground Truth\nY [μm]')
     axs[1][0].set_ylabel('Predicted\nY [μm]')
+    axs[2][0].set_ylabel('Abs Error\nY [μm]')
 
-    fig.tight_layout(rect=(0, 0, 0.95, 1))
-    cbar_ax = fig.add_axes((0.96, 0.15, 0.015, 0.7))
+    fig.tight_layout(rect=(0, 0, 0.92, 1))
+    cbar_ax = fig.add_axes((0.93, 0.38, 0.015, 0.6))
     cbar = fig.colorbar(sc, cax=cbar_ax)
     cbar.set_label(cbar_label)
+
+    err_cbar_ax = fig.add_axes((0.93, 0.08, 0.015, 0.22))
+    err_cbar = fig.colorbar(err_sc, cax=err_cbar_ax)
+    err_cbar.set_label(f'|pred − true| {cbar_label}')
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -280,6 +243,67 @@ def plot_e_comparison(component, results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR,
     )
 
 
+def pointwise_error_summary(results_dir=RESULTS_DIR, data_path=DATA_PATH,
+                             strain_data_path=STRAIN_DATA_PATH):
+    """mean/RMS/max pointwise abs error for c and each strain component, split into
+    train slices (all but the last time slice) vs. the held-out test slice. the
+    same train/test split used during training (num_test_slices=1, last slice held out)"""
+    train_times, test_time = TIMES[:-1], TIMES[-1]
+
+    df_c_gt = pd.read_csv(data_path)
+    df_c_pred = pd.read_csv(os.path.join(results_dir, 'pred_c.csv'))
+    df_strain_gt = load_strain_gt(strain_data_path)
+
+    fields = {
+        'c': (
+            df_c_gt[[f'C [t={t}]' for t in TIMES]].to_numpy(),
+            df_c_pred[[f'pred_c{t}' for t in TIMES]].to_numpy(),
+        ),
+    }
+    for comp in ('e11', 'e22', 'e12'):
+        df_pred = pd.read_csv(os.path.join(results_dir, f'pred_{comp[0]}_{comp[1:]}.csv'))
+        fields[comp] = (
+            df_strain_gt[[f'{comp}_t{t}' for t in TIMES]].to_numpy(),
+            df_pred[[f'pred_{comp[0]}_{comp[1:]}{t}' for t in TIMES]].to_numpy(),
+        )
+
+    rows = []
+    for name, (gt, pred) in fields.items():
+        abs_err = np.abs(pred - gt)
+        train_err, train_gt = abs_err[:, :-1], gt[:, :-1]
+        test_err, test_gt = abs_err[:, -1], gt[:, -1]
+        # omit RMSE % for strain cuz small absolute vals causes percentages to explode
+        gt_range = 1.0 if name == 'c' else gt.max() - gt.min()
+        row = {
+            'field': name,
+            'train_mean_abs_error': train_err.mean(),
+            'train_rms_error': np.sqrt((train_err ** 2).mean()),
+            'train_max_abs_error': train_err.max(),
+            'test_mean_abs_error': test_err.mean(),
+            'test_rms_error': np.sqrt((test_err ** 2).mean()),
+            'test_max_abs_error': test_err.max(),
+            'train_nrmse_pct': 100 * np.sqrt((train_err ** 2).mean()) / gt_range,
+            'test_nrmse_pct': 100 * np.sqrt((test_err ** 2).mean()) / gt_range,
+        }
+        # plain pointwise percent error only makes sense for c it's bounded well away
+        # from zero (min ~0.013); the strain fields cross zero, so left as NaN for those
+        if name == 'c':
+            row['train_mean_pct_error'] = 100 * (train_err / train_gt).mean()
+            row['test_mean_pct_error'] = 100 * (test_err / test_gt).mean()
+        else:
+            row['train_mean_pct_error'] = np.nan
+            row['test_mean_pct_error'] = np.nan
+        rows.append(row)
+    df_summary = pd.DataFrame(rows).set_index('field')
+
+    os.makedirs(results_dir, exist_ok=True)
+    df_summary.to_csv(os.path.join(results_dir, 'pointwise_error_summary.csv'))
+    print(f'\nPointwise error summary ({results_dir}) -- '
+          f'train slices t={train_times}, test slice t={test_time}:')
+    print(df_summary.to_string(float_format=lambda v: f'{v:.5f}'))
+    return df_summary
+
+
 def plot_identified_j0_curve(data_path=IDENTIFIED_J0_PATH, plots_dir=PLOTS_DIR):
     df = pd.read_csv(data_path)
 
@@ -300,15 +324,59 @@ def plot_identified_j0_curve(data_path=IDENTIFIED_J0_PATH, plots_dir=PLOTS_DIR):
     plt.close(fig)
 
 
-def plot_k_spatial(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
-    df = pd.read_csv(os.path.join(results_dir, 'pred_k.csv'))
-    field_cols = [c for c in df.columns if c.startswith('pred_k')]
+def plot_k_comparison(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
+    df = pd.read_csv(os.path.join(results_dir, 'k_grf_comparison.csv'))
+    vmin = min(df['grf_interpolated'].min(), df['pred_k'].min())
+    vmax = max(df['grf_interpolated'].max(), df['pred_k'].max())
 
-    z = df[field_cols[0]]
+    fig, axs = plt.subplots(1, 2, figsize=(11, 5))
+    axs[0].scatter(df['x'], df['y'], c=df['grf_interpolated'], cmap='viridis',
+                   s=20, vmin=vmin, vmax=vmax)
+    axs[0].set_title('Ground Truth k(x, y)')
+    sc = axs[1].scatter(df['x'], df['y'], c=df['pred_k'], cmap='viridis',
+                         s=20, vmin=vmin, vmax=vmax)
+    axs[1].set_title('Predicted k(x, y)')
+    for ax in axs:
+        ax.set_xlabel('X [μm]')
+        ax.set_ylabel('Y [μm]')
+
+    fig.tight_layout(rect=(0, 0, 0.95, 1))
+    cbar_ax = fig.add_axes((0.96, 0.15, 0.015, 0.7))
+    cbar = fig.colorbar(sc, cax=cbar_ax)
+    cbar.set_label('k(x, y)')
+
+    os.makedirs(plots_dir, exist_ok=True)
+    fig.savefig(os.path.join(plots_dir, 'k_comparison.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_k_pointwise_error(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
+    df = pd.read_csv(os.path.join(results_dir, 'k_grf_comparison.csv'))
+    abs_error = (df['pred_k'] - df['grf_interpolated']).abs()
 
     fig, ax = plt.subplots(figsize=(6, 5))
-    sc = ax.scatter(df['x'], df['y'], c=z, cmap='viridis', s=25)
-    ax.set_title('Predicted k(x, y)')
+    sc = ax.scatter(df['x'], df['y'], c=abs_error, cmap='hot_r', s=20)
+    ax.set_title('Pointwise Abs Error: k(x, y)')
+    ax.set_xlabel('X [μm]')
+    ax.set_ylabel('Y [μm]')
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label('|k_pred − k_true|')
+
+    fig.tight_layout()
+    os.makedirs(plots_dir, exist_ok=True)
+    fig.savefig(os.path.join(plots_dir, 'pointwise_k_error.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_k_pred_grf_grid(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
+    """standalone predicted k(x, y), self-scaled to the prediction's own range,
+    evaluated on the GRF's own (denser) grid -- companion to plot_pred('k'),
+    which does the same thing but on the training/prediction mesh"""
+    df = pd.read_csv(os.path.join(results_dir, 'k_grf_comparison.csv'))
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sc = ax.scatter(df['x'], df['y'], c=df['pred_k'], cmap='viridis', s=10)
+    ax.set_title('Predicted k(x, y) (GRF grid)')
     ax.set_xlabel('X [μm]')
     ax.set_ylabel('Y [μm]')
     cbar = fig.colorbar(sc, ax=ax)
@@ -316,12 +384,123 @@ def plot_k_spatial(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
 
     fig.tight_layout()
     os.makedirs(plots_dir, exist_ok=True)
-    fig.savefig(os.path.join(plots_dir, 'pred_k_spatial.png'), dpi=150, bbox_inches='tight')
+    fig.savefig(os.path.join(plots_dir, 'pred_k_grf_grid.png'), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
+def plot_mu_h_gt(data_path=CHEM_DATA_PATH, plots_dir=PLOTS_DIR):
+    df = pd.read_csv(data_path)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(df['concentration'], df['chemical_potential'])
+    ax.set_xlabel('Concentration c')
+    ax.set_ylabel('Ground Truth mu_h(c)')
+    ax.grid(True, which='both', alpha=0.3)
+    fig.tight_layout()
+    os.makedirs(plots_dir, exist_ok=True)
+    fig.savefig(os.path.join(plots_dir, 'mu_h_gt.png'), dpi=150)
+    plt.close(fig)
+
+
+def _pool_at_gt_c(results_dir, field):
+    """long-format concentration/field(c) pairs pooled across all time slices, using
+    the model's evaluation at the GT concentration values (see save_mu_h_j0_at_gt_c
+    in the training script) rather than the model's own predicted c"""
+    df = pd.read_csv(os.path.join(results_dir, 'mu_h_j0_at_gt_c.csv'))
+    slices = [
+        pd.DataFrame({
+            'concentration': df[f'gt_c{t}'],
+            field: df[f'{field}_at_gt_c{t}'],
+        })
+        for t in TIMES
+    ]
+    return pd.concat(slices, ignore_index=True)
+
+
+def plot_mu_h_comparison(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR, data_path=CHEM_DATA_PATH):
+    pooled = _pool_at_gt_c(results_dir, 'mu_h')
+    gt = pd.read_csv(data_path)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.scatter(pooled['concentration'], pooled['mu_h'], s=8, alpha=0.3, label='Approximated (at GT c)')
+    ax.plot(gt['concentration'], gt['chemical_potential'], color='black', linewidth=2, label='Ground truth')
+    ax.set_xlim(pooled['concentration'].min() - 0.02, pooled['concentration'].max() + 0.02)
+    ax.set_xlabel('Normalized concentration, c')
+    ax.set_ylabel('mu_h(c)')
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.3)
+    fig.tight_layout()
+    os.makedirs(plots_dir, exist_ok=True)
+    fig.savefig(os.path.join(plots_dir, 'mu_h_comparison.png'), dpi=150)
+    plt.close(fig)
+
+
+def plot_j0_comparison(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR, data_path=IDENTIFIED_J0_PATH):
+    pooled = _pool_at_gt_c(results_dir, 'j0')
+    gt = pd.read_csv(data_path)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.scatter(pooled['concentration'], pooled['j0'], s=8, alpha=0.3, label='Predicted (at GT c)')
+    ax.plot(gt['conc'], gt['j0'], color='black', linewidth=2, label='Identified (ground truth)')
+    ax.set_xlabel('Normalized concentration, c')
+    ax.set_ylabel('j0(c)')
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.3)
+    fig.tight_layout()
+    os.makedirs(plots_dir, exist_ok=True)
+    fig.savefig(os.path.join(plots_dir, 'j0_comparison.png'), dpi=150)
+    plt.close(fig)
+
+
+def _pointwise_error_over_time(results_dir, plots_dir, field, gt_conc, gt_field, cbar_label, save_name):
+    df = pd.read_csv(os.path.join(results_dir, 'mu_h_j0_at_gt_c.csv'))
+    n = len(TIMES)
+    ncols = min(3, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axs = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+    for idx, t in enumerate(TIMES):
+        r, c = divmod(idx, ncols)
+        ax = axs[r][c]
+        pred = df[f'{field}_at_gt_c{t}'].to_numpy()
+        conc = df[f'gt_c{t}'].to_numpy()
+        gt_at_conc = np.interp(conc, gt_conc, gt_field)
+        abs_error = np.abs(pred - gt_at_conc)
+        sc = ax.scatter(df['x'], df['y'], c=abs_error, cmap='hot_r', s=20)
+        ax.set_title(f't = {t}')
+        ax.set_xlabel('X [μm]')
+        ax.set_ylabel('Y [μm]')
+        cbar = fig.colorbar(sc, ax=ax)
+        cbar.set_label(cbar_label)
+
+    for idx in range(n, nrows * ncols):
+        r, c = divmod(idx, ncols)
+        axs[r][c].set_visible(False)
+
+    fig.tight_layout()
+    os.makedirs(plots_dir, exist_ok=True)
+    fig.savefig(os.path.join(plots_dir, save_name), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_mu_h_pointwise_error(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR, data_path=CHEM_DATA_PATH):
+    gt = pd.read_csv(data_path).sort_values('concentration')
+    _pointwise_error_over_time(
+        results_dir, plots_dir, 'mu_h', gt['concentration'].to_numpy(), gt['chemical_potential'].to_numpy(),
+        '|mu_h_pred − mu_h_true|', 'pointwise_mu_h_error.png',
+    )
+
+
+def plot_j0_pointwise_error(results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR, data_path=IDENTIFIED_J0_PATH):
+    gt = pd.read_csv(data_path).sort_values('conc')
+    _pointwise_error_over_time(
+        results_dir, plots_dir, 'j0', gt['conc'].to_numpy(), gt['j0'].to_numpy(),
+        '|j0_pred − j0_true|', 'pointwise_j0_error.png',
+    )
+
+
 def plot_over_c(field, results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
-    if field not in ('k', 'j_0'):
+    if field not in ('k', 'j_0', 'mu_h'):
         raise ValueError('Invalid field requested')
     df_c = pd.read_csv(DATA_PATH)
     df_field = pd.read_csv(os.path.join(results_dir, f'pred_{field}.csv'))
@@ -350,16 +529,14 @@ def plot_over_c(field, results_dir=RESULTS_DIR, plots_dir=PLOTS_DIR):
 
 
 if __name__ == '__main__':
+    pointwise_error_summary()
     plot_loss_history()
+    plot_loss_history_no_interp()
     plot_lambda_history()
     plot_train_test_loss('c')
     plot_train_test_loss('e11')
     plot_train_test_loss('e12')
     plot_train_test_loss('e22')
-    plot_pointwise_error('c')
-    plot_pointwise_error('e11')
-    plot_pointwise_error('e12')
-    plot_pointwise_error('e22')
     plot_gt_c()
     plot_pred('c')
     plot_pred('e_11')
@@ -372,6 +549,13 @@ if __name__ == '__main__':
     plot_e_comparison('11')
     plot_e_comparison('12')
     plot_e_comparison('22')
-    plot_pointwise_error_combined()
     plot_identified_j0_curve()
-    plot_k_spatial()
+    plot_k_comparison()
+    plot_k_pointwise_error()
+    plot_k_pred_grf_grid()
+    plot_over_c('mu_h')
+    plot_mu_h_gt()
+    plot_mu_h_comparison()
+    plot_j0_comparison()
+    plot_mu_h_pointwise_error()
+    plot_j0_pointwise_error()

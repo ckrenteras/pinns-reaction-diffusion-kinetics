@@ -12,5 +12,5 @@ source ~/env/crunch_env/bin/activate
 
 cd /users/ckrenter/Desktop/CRUNCH-summer-2026/pinns-reaction-diffusion-kinetics
 mkdir -p logs
-echo "Running allen_cahn_v4_warmup (Adam-only 1k epochs, no interp, no patience, data-only warmup for first half)"
+echo "Running allen_cahn_v4_warmup (Adam 1k epochs, no interp, no patience, data-only warmup for first half, then SSBroyden QN stage with interp)"
 python -u allen_cahn_v4_warmup.py

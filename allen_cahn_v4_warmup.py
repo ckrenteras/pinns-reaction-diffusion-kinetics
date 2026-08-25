@@ -4,7 +4,8 @@ import torch
 
 import allen_cahn_v4 as v4
 
-# v4 but warm-up stage added with only data loss for first half of adam training
+# v4 but warm-up stage added with only data loss for first half of adam training,
+# followed by an SSBroyden QN stage (same as v4.py's main())
 
 MODEL_DIR = os.path.join('.', 'models', 'v4_warmup')
 RESULTS_DIR = os.path.join('.', 'results', 'v4_warmup')
@@ -31,6 +32,9 @@ def train_pinn_adam_only_warmup(model, adam_loader, lambdas=v4.DEFAULT_LAMBDAS,
     per_epoch_lambdas = {name: np.zeros(adam_epochs) for name in v4.ALL_TERM_NAMES}
     per_epoch_test_total = np.zeros(adam_epochs)
     per_epoch_test_terms = {name: np.zeros(adam_epochs) for name in v4.ALL_TERM_NAMES}
+    per_epoch_k_std = np.zeros(adam_epochs)
+    per_epoch_k_min = np.zeros(adam_epochs)
+    per_epoch_k_max = np.zeros(adam_epochs)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(adam_epochs, 1), eta_min=v4.COSINE_ETA_MIN)
@@ -93,6 +97,8 @@ def train_pinn_adam_only_warmup(model, adam_loader, lambdas=v4.DEFAULT_LAMBDAS,
         for name in v4.ALL_TERM_NAMES:
             per_epoch_terms[name][epoch] = iter_term_sums[name]
             per_epoch_lambdas[name][epoch] = step_lambdas[name]
+        per_epoch_k_std[epoch], per_epoch_k_min[epoch], per_epoch_k_max[epoch] = (
+            v4.k_output_stats(model, x_vals_np, y_vals_np))
 
         if test_loader is not None:
             test_total_loss, test_term_sums = v4.eval_pinn(model, test_loader, step_lambdas)
@@ -104,7 +110,11 @@ def train_pinn_adam_only_warmup(model, adam_loader, lambdas=v4.DEFAULT_LAMBDAS,
         else:
             ckpt_loss = sum(v4.DEFAULT_LAMBDAS[name] * iter_term_sums[name] for name in v4.ALL_TERM_NAMES)
 
-        if ckpt_loss < best_loss:
+        # same safeguard as v4.train_pinn_adam_only: a checkpoint only becomes eligible
+        # once the lambdas have been rebalanced at least once, so a near-random-init
+        # network can't win "best" by scoring deceptively well on the held-out
+        # (extrapolation) test slice purely by chance before it's learned anything
+        if epoch >= v4.GRAD_NORM_REBALANCE_EVERY and ckpt_loss < best_loss:
             best_loss = ckpt_loss
             torch.save(model.state_dict(), os.path.join(model_dir, 'best_model.pt'))
 
@@ -118,15 +128,28 @@ def train_pinn_adam_only_warmup(model, adam_loader, lambdas=v4.DEFAULT_LAMBDAS,
             if test_loader is not None:
                 print(f'         test total loss: {per_epoch_test_total[epoch]}')
 
+    if best_loss == float('inf'):
+        # adam_epochs was too short to clear the GRAD_NORM_REBALANCE_EVERY floor above,
+        # so no checkpoint was ever saved this run; fall back to the final weights so
+        # best_model.pt always reflects this run instead of silently reusing a stale
+        # file left over from a previous experiment
+        torch.save(model.state_dict(), os.path.join(model_dir, 'best_model.pt'))
+
+    per_epoch_k_stats = {'std': per_epoch_k_std, 'min': per_epoch_k_min, 'max': per_epoch_k_max}
+
     return (best_loss, per_epoch_total, per_epoch_terms, per_epoch_lambdas, per_epoch_test_total,
-            per_epoch_test_terms, adam_epochs)
+            per_epoch_test_terms, adam_epochs, per_epoch_k_stats)
 
 
 def main():
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
     adam_train_loader, test_loader = v4.load_data()
+    interp_train_loader = v4.interp_loader()
 
     netA = v4.PINN(in_channels=v4.IN_CH_ONE, out_channels=v4.OUT_CH_ONE)
     netB = v4.PINN(in_channels=v4.IN_CH_TWO, out_channels=v4.OUT_CH_TWO)
@@ -138,24 +161,59 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     (best_loss, per_step_total, per_step_terms, per_step_lambdas, per_step_test_total,
-     per_step_test_terms, adam_epochs_run) = train_pinn_adam_only_warmup(
+     per_step_test_terms, adam_epochs_run, per_step_k_stats) = train_pinn_adam_only_warmup(
         model=pinn, adam_loader=adam_train_loader,
         lambdas=v4.DEFAULT_LAMBDAS, warmup_lambdas=WARMUP_LAMBDAS,
         adam_epochs=v4.NEPOCHS_ADAM, warmup_fraction=WARMUP_FRACTION,
         lr=v4.LR, model_dir=MODEL_DIR, test_loader=test_loader,
     )
 
-    v4.save_loss_csv(per_step_total, per_step_terms, per_step_lambdas, results_dir=RESULTS_DIR,
-                      adam_epochs=adam_epochs_run, test_total=per_step_test_total,
-                      test_terms=per_step_test_terms)
+    # hand the QN phase Adam's best checkpoint (by the fixed-lambda ckpt_loss)
+    # not necessarily its last epoch
+    pinn.load_state_dict(torch.load(os.path.join(MODEL_DIR, 'best_model.pt')))
+    adam_final_lambdas = {name: float(per_step_lambdas[name][-1]) for name in v4.ALL_TERM_NAMES}
+
+    qn_full_loader = v4.full_batch_loader()
+    qn_inputs, qn_labels = next(iter(qn_full_loader))
+    interp_inputs, interp_labels = next(iter(interp_train_loader))
+    x_vals_np, y_vals_np = v4.load_domain_xy()
+
+    (qn_best_loss, qn_per_iter_total, qn_per_iter_terms, qn_per_iter_lambdas,
+     qn_per_iter_test_total, qn_per_iter_test_terms, qn_iters_run,
+     qn_per_iter_k_stats) = v4.train_pinn_qn(
+        model=pinn, qn_inputs=qn_inputs, qn_labels=qn_labels,
+        interp_inputs=interp_inputs, interp_labels=interp_labels,
+        lambdas=adam_final_lambdas, x_vals_np=x_vals_np, y_vals_np=y_vals_np,
+        model_dir=MODEL_DIR, test_loader=test_loader,
+        # patience >= max_iters makes epochs_since_improvement unreachable within
+        # the loop, i.e. no early stop -- run the full QN budget regardless
+        # (matches allen_cahn_v4.py's main())
+        patience=v4.QN_MAX_ITERS,
+    )
+
+    combined_total = np.concatenate([per_step_total, qn_per_iter_total])
+    combined_terms = {name: np.concatenate([per_step_terms[name], qn_per_iter_terms[name]])
+                       for name in v4.ALL_TERM_NAMES}
+    combined_lambdas = {name: np.concatenate([per_step_lambdas[name], qn_per_iter_lambdas[name]])
+                         for name in v4.ALL_TERM_NAMES}
+    combined_test_total = np.concatenate([per_step_test_total, qn_per_iter_test_total])
+    combined_test_terms = {name: np.concatenate([per_step_test_terms[name], qn_per_iter_test_terms[name]])
+                            for name in v4.ALL_TERM_NAMES}
+    combined_k_stats = {stat: np.concatenate([per_step_k_stats[stat], qn_per_iter_k_stats[stat]])
+                         for stat in ('std', 'min', 'max')}
+
+    v4.save_loss_csv(combined_total, combined_terms, combined_lambdas, results_dir=RESULTS_DIR,
+                      adam_epochs=adam_epochs_run, test_total=combined_test_total,
+                      test_terms=combined_test_terms, k_stats=combined_k_stats)
 
     pinn.load_state_dict(torch.load(os.path.join(MODEL_DIR, 'best_model.pt')))
     v4.eval_pinn(pinn, test_loader, v4.DEFAULT_LAMBDAS)
 
-    v4.save_pointwise_c_error(pinn, results_dir=RESULTS_DIR)
-    v4.save_pointwise_e_error(pinn, results_dir=RESULTS_DIR)
     for i in range(6):
         v4.save_preds(pinn, i, results_dir=RESULTS_DIR)
+    v4.save_mu_h_preds(pinn, results_dir=RESULTS_DIR)
+    v4.save_k_at_grf_points(pinn, results_dir=RESULTS_DIR)
+    v4.save_mu_h_j0_at_gt_c(pinn, results_dir=RESULTS_DIR)
 
 
 if __name__ == "__main__":
