@@ -1,0 +1,9 @@
+# torch is built against CUDA 12.6 (+cu126) in the working env (crunch_env); a plain
+# `pip install -r requirements.txt` will pull the CPU-only build instead.
+# For the matching CUDA build, install from the PyTorch index, e.g.:
+#   pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cu126
+numpy==2.4.6
+pandas==3.0.3
+scipy==1.17.1
+matplotlib==3.11.0
+torch==2.12.1

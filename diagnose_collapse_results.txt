@@ -1,9 +1,0 @@
-Writing results to /oscar/home/ckrenter/Desktop/CRUNCH-summer-2026/pinns-reaction-diffusion-kinetics/diagnose_collapse_results.txt
-
-=== E: force_balance lambda slashed to 1e-4 (everything else current/default) ===
-epoch 0 (init) std: c=0.00188 e=0.09166 k=0.01063
-EPOCH: 0  | c: 0.109164277392049  | e11: 0.5152614462760187  | e22: 2.0801096731616604  | e12: 13.092948052190966  | allen_cahn: 2.657746273554597e-06  | force_balance: 34020.56458700857  | k_reg: 0.0046325356154064195  | interp_c: 0.10799870183390956  | interp_e11: 0.5354434117194145  | interp_e22: 2.1682923109300676  | interp_e12: 13.592768023090978  | total loss: 22.2333922232351  | lr: 9.998e-05
-         lam_c: 1.195  | lam_e11: 1  | lam_e22: 1.264  | lam_e12: 1.089  | lam_allen_cahn: 160.4  | lam_force_balance: 9.002e-05  | lam_k_reg: 0.001  | lam_interp_c: 0.1  | lam_interp_e11: 0.1  | lam_interp_e22: 0.1  | lam_interp_e12: 0.1
-         test total loss: 11.37846565246582
-epoch 100 std: c=0.00285 e=0.18805 k=0.00191
-mu_res_raw final: 0.0198182
